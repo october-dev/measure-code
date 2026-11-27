@@ -23,6 +23,10 @@ Writes into --out:
   measure.json          all counts (schema october.measure/v1, kind "code")
   summary_row.json/.csv one flat row per repository, for spreadsheets
   report.md             the same numbers for people
+  commits.sha256.txt    one salted, truncated hash per commit (and Perforce changelist) with its day, so a
+                        studio can count distinct commits across forks, copies and mirrors; safe to send
+  own_files.sha256.txt  one salted, truncated hash per own-code file content with its lines, so a studio
+                        can count a file that appears in two repos once; safe to send
 
 `--verify <measure.json>` re-measures a copy of the repository and checks the
 stable figures, fingerprints and digests of an existing measure.json.
@@ -47,6 +51,7 @@ import os
 import platform
 import random
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -55,7 +60,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 TOOL = "measure-code"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 SCHEMA = "october.measure/v1"
 SKETCH_K = 256
 TASK_KINDS = ("bugfix", "feature", "restructure", "exploratory")
@@ -1417,6 +1422,53 @@ def link_hash(kind: str, value: str, salt: str = "") -> str:
     return hashlib.sha256(f"{salt}|{kind}|{value}".encode("utf-8", "replace")).hexdigest()[:16]
 
 
+COMMIT_IDS_FILE = "commits.sha256.txt"
+OWN_FILES_FILE = "own_files.sha256.txt"
+ID_HASH_NOTE = "first 16 hex characters of sha256(salt|kind|id); the salt never leaves this machine"
+
+
+def load_salt(path: Path) -> tuple:
+    """The commit-id salt: read from the studio's salt file, or created there (random, owner-only) on first use.
+    Returns (salt, how): how is 'file' when it already existed, 'created' when this run made it."""
+    if path.is_file():
+        s = path.read_text(encoding="utf-8").strip()
+        if s:
+            return s, "file"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    s = secrets.token_hex(16)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(s + "\n")
+    return s, "created"
+
+
+def id_hash(salt: str, kind: str, value: str) -> str:
+    return hashlib.sha256(f"{salt}|{kind}|{value}".encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def salt_fingerprint(salt: str) -> str:
+    """Lets studio.py check that every repo of a studio used the same salt, without revealing it."""
+    return hashlib.sha256(f"fingerprint|{salt}".encode("utf-8")).hexdigest()[:12]
+
+
+def commit_ids(repo: Path, rev: list, pathspec: list, salt: str) -> list:
+    """[(id, author day)] for every commit in the measured history: the same commit gets the same id in a fork, copy
+    or mirror measured with the same salt, so a studio can count it once."""
+    out = []
+    for line in git(repo, "log", "--format=%H %at", *rev, *pathspec).splitlines():
+        sha, _, at = line.partition(" ")
+        if sha:
+            out.append((id_hash(salt, "commit", sha), iso_day(int(at)) if at.strip().isdigit() else "unknown"))
+    return out
+
+
+def write_id_file(path: Path, kind: str, fp: str, rows: list, line_note: str) -> None:
+    head = [f"# measure-code {kind} v1", f"# salt-fingerprint: {fp}", f"# line: {line_note}",
+            "# safe to send: hashes only; the salt stays on the studio's machine, so a line cannot be turned back into "
+            "a commit or file, or matched to another studio's list"]
+    atomic_write(path, "\n".join(head + [f"{a} {b}" for a, b in sorted(set(rows))]) + "\n")
+
+
 def norm_name(name: str) -> str | None:
     import unicodedata
     s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
@@ -1937,6 +1989,7 @@ def stage_own_code(repo: Path, studio: list, settle: dict, bp: bool = True) -> d
         "assets_own": assets_own, "assets_excluded": assets_excluded, "lfs_pointer_assets": lfs,
         "unsettled": unsettled,
         "_bp": {"status": bp_status, "total": bp_total, "own": dict(split["own"]), "excluded": dict(split["excluded"])},
+        "_own_ids": [[r[5], r[2]] for r in own],
         "_private": private,
     }
 
@@ -1976,7 +2029,7 @@ def stage_p4(paths: list) -> dict:
         return {"status": "not_requested"}
     if not shutil.which("p4"):
         return {"status": "cli_missing", "label": "unknown", "method": "p4 command not found"}
-    changes, times, users = set(), [], set()
+    changes, times, users, change_days = set(), [], set(), {}
     try:
         for path in paths:
             out = subprocess.run(["p4", "-ztag", "changes", "-s", "submitted", path], capture_output=True, timeout=1800,
@@ -1992,6 +2045,7 @@ def stage_p4(paths: list) -> dict:
                         changes.add(cur["change"])
                         if cur.get("time", "").isdigit():
                             times.append(int(cur["time"]))
+                            change_days[cur["change"]] = iso_day(int(cur["time"]))
                         if cur.get("user"):
                             users.add(h(cur["user"].lower()))
                     cur = {"change": v.strip()}
@@ -1999,9 +2053,12 @@ def stage_p4(paths: list) -> dict:
                     cur[k] = v.strip()
         uout = subprocess.run(["p4", "-ztag", "users"], capture_output=True, timeout=600, check=False).stdout.decode("utf-8", "replace")
         server_users = sum(1 for line in uout.splitlines() if line.startswith("... User "))
+        iout = subprocess.run(["p4", "-ztag", "info"], capture_output=True, timeout=120, check=False).stdout.decode("utf-8", "replace")
+        sid = re.search(r"^\.\.\. (?:serverID|serverAddress) (.+)$", iout, re.M)
     except (subprocess.TimeoutExpired, OSError):
         return {"status": "failed", "label": "unknown", "method": "p4 did not answer"}
-    return {"status": "counted", "paths": len(paths), "submitted_changes": len(changes),
+    return {"_changes": sorted(change_days.items()), "_server": h("p4server:" + sid.group(1).strip()) if sid else "default",
+            "status": "counted", "paths": len(paths), "submitted_changes": len(changes),
             "first_change": iso_day(min(times)) if times else None, "last_change": iso_day(max(times)) if times else None,
             "submitting_accounts": len(users), "server_users": server_users, "label": "verified",
             "method": "p4 changes -s submitted per path (each changelist once) and p4 users; accounts, not people; "
@@ -2225,6 +2282,7 @@ STRING_FIELDS = [re.compile(p) for p in (
     r"^ticket_refs\.(label|method|key_hashes\[\d+\])$",
     r"^engine_content\.(label|todo|files_label|counter|status|method|partial_reason)$", r"^own_code\.(label|method)$",
     r"^perforce\.(status|label|method|first_change|last_change)$",
+    r"^commit_ids\.(status|reason|file|own_files_file|salt_fingerprint|salt_source|hash|label|method)$",
     r"^code_table\.(project|type|type_label|engine|vcs|primary_language|first_commit|last_commit)$",
 )]
 EMAIL_RX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -2429,6 +2487,14 @@ def people_section(doc: dict) -> list:
               f"{fmt((bp.get('project_key') or {}).get('commits'))} commits, {fmt((bp.get('project_key') or {}).get('distinct_keys'))} keys; "
               f"#123 references: {fmt((bp.get('hash_number') or {}).get('commits'))} commits, "
               f"{fmt((bp.get('hash_number') or {}).get('distinct_keys'))} keys. Hashed keys let resolved bugs be linked to fixes."]
+    ci = doc.get("commit_ids") or {}
+    if ci.get("status") == "written":
+        L += ["", f"Commit ids: {fmt(ci.get('count'))} hashed commit ids in `commits.sha256.txt`"
+                  + (f" and {fmt(ci.get('own_files'))} own-code file ids in `own_files.sha256.txt`" if ci.get("own_files") is not None else "")
+                  + f" (salt fingerprint {ci.get('salt_fingerprint')}, {ci.get('salt_source')}). A studio counts distinct "
+                    "commits and files across its repos from these lists; they hold hashes only and are safe to send."]
+    elif ci:
+        L += ["", f"Commit ids: not written ({ci.get('reason')})."]
     fb = ec.get("files_by_type") or {}
     L += ["", "Engine content tracked: " + ", ".join(f"{k} {fmt(v)}" for k, v in fb.items()) + "."]
     if rs:
@@ -2731,6 +2797,9 @@ def main(argv=None) -> int:
                     help="second cutoff (default 2022-11-30, the public ChatGPT launch): pre-ChatGPT counts and shares")
     ap.add_argument("--link-salt", default="",
                     help="secret mixed into the hashed person and ticket keys; pass the same value to every run of a studio")
+    ap.add_argument("--commit-salt-file", type=Path,
+                    help="file holding the salt for the hashed commit and file ids (created if missing). Pass the same file to "
+                         "every repo of one studio so forks, copies and mirrors are counted once; default <out>/.state/commit-salt")
     ap.add_argument("--flag", action="append", default=[], metavar="NAME[=no]",
                     help="self-reported restriction flag: " + ", ".join(RESTRICTION_FLAGS) + " (repeatable; NAME=no records false)")
     ap.add_argument("--ownership", choices=["own", "client_owned", "unclear"],
@@ -2963,6 +3032,7 @@ def main(argv=None) -> int:
                 + ("; to settle: " + "; ".join(open_items) if open_items else "")))
     doc["engine_content"] = blueprint_block(own, names_all)
     doc["perforce"] = stage_p4(a.p4_path)
+    p4_changes, p4_server = doc["perforce"].pop("_changes", []), doc["perforce"].pop("_server", "default")
     if doc["perforce"]["status"] != "not_requested":
         lanes["perforce"] = doc["perforce"]["status"].replace("_", " ")
     fresh = bool(n_commits and n_commits <= 20 and (gitres.get("span_days") or 0) <= 14)
@@ -2999,6 +3069,30 @@ def main(argv=None) -> int:
     lanes["dream"] = {"written": "why this is special written by the agent after the audit (not a measurement)",
                       "skipped": "skipped (--no-dream)", "pending": "pending: the agent writes it after the audit (add_dream.py)",
                       "needs_rewrite": "the saved pitch no longer matches these numbers; write it again"}[doc["dream"]["status"]]
+    salt, salt_how = load_salt((a.commit_salt_file.expanduser().resolve() if a.commit_salt_file else out / ".state" / "commit-salt"))
+    fp = salt_fingerprint(salt)
+    cids, why_not = [], None
+    if not state["is_git"] and not p4_changes:
+        why_not = "not a git repository"
+    elif state["is_git"] and not state["has_commits"] and not p4_changes:
+        why_not = "no commits"
+    elif gitres.get("history_shallow"):
+        why_not = "shallow clone: history incomplete"
+    else:
+        if state["is_git"] and state["has_commits"]:
+            cids = commit_ids(repo, ref["_rev"], pathspec, salt)
+        cids += [(id_hash(salt, "p4", f"{p4_server}|{c}"), day or "unknown") for c, day in p4_changes]
+    own_ids = own.get("_own_ids")
+    fids = [(id_hash(salt, "file", b), n) for b, n in own_ids] if own_ids is not None and own["own_loc"] is not None else None
+    doc["commit_ids"] = {
+        "status": "not_written" if why_not else "written", "reason": why_not,
+        "file": None if why_not else COMMIT_IDS_FILE, "count": None if why_not else len(set(cids)),
+        "p4_changes": len(p4_changes), "own_files_file": OWN_FILES_FILE if fids is not None else None,
+        "own_files": len({x for x, _ in fids}) if fids is not None else None,
+        "salt_fingerprint": fp, "salt_source": "studio salt file" if a.commit_salt_file else "this run only",
+        "hash": ID_HASH_NOTE, "label": "unknown" if why_not else "verified",
+        "method": "one line per commit in the measured history (git log of the measured ref) and per submitted Perforce "
+                  "changelist, each hashed with the salt; the studio counts distinct lines across its repos"}
     doc["provenance"] = {"head_commit_fingerprint": head_fp, "measured_commit_fingerprint": measured_fp,
                          "scripts_digest": scripts_digest(), "payload_digest": None}
     doc["provenance"]["payload_digest"] = payload_digest(doc)
@@ -3017,6 +3111,19 @@ def main(argv=None) -> int:
         w.writeheader()
         w.writerow(row)
     atomic_write(out / "report.md", render_report(doc))
+    for stale, keep in ((COMMIT_IDS_FILE, not why_not), (OWN_FILES_FILE, fids is not None)):
+        if not keep and (out / stale).exists():
+            (out / stale).unlink()
+    if not why_not:
+        write_id_file(out / COMMIT_IDS_FILE, "commit ids", fp, cids,
+                      "<id> <author day, UTC>; id = first 16 hex of sha256(salt|commit|<commit sha>) or "
+                      "sha256(salt|p4|<server>|<changelist>)")
+    if fids is not None:
+        write_id_file(out / OWN_FILES_FILE, "own-code file ids", fp, fids,
+                      "<id> <own lines of code in that file>; id = first 16 hex of sha256(salt|file|<content id>)")
+    if salt_how == "created" and not a.commit_salt_file:
+        log("commit ids hashed with a salt made for this run only; to count shared history once across a studio's repos, "
+            "pass the same --commit-salt-file to every run")
     if own.get("_private"):
         write_private(out, own, doc["label"])
         log(f"settling list (names, PRIVATE, stays on this machine): {out / '.private' / 'settling.md'}")

@@ -59,6 +59,7 @@ Or in your coding agent (Claude Code, Codex, Grok, Hermes ...):
 | `--cutoff DATE` | 2025-01-01 | date for pre-cutoff shares. The default is there because buyers price work written before 2025 |
 | `--cutoff-early DATE` | 2022-11-30 | second cutoff for pre-ChatGPT counts and shares |
 | `--link-salt S` | empty | secret mixed into hashed person and ticket keys; use the same value for every run of one studio |
+| `--commit-salt-file F` | `<out>/.state/commit-salt` | file holding the salt for the hashed commit and own-file ids (created if missing); pass the same file to every repo of one studio so shared history counts once |
 | `--flag NAME[=no]` | none | self-reported restriction flag: client_owned, platform_nda, third_party_middleware, player_personal_data, staff_personal_data, secrets |
 | `--ownership` | own | own, client_owned or unclear |
 | `--studio-name NAME` | none | the studio's name or a former name (repeatable): plugins and copyright headers naming it count as own code |
@@ -84,10 +85,23 @@ measure-out/game-client/
 ├── summary_row.json   # one flat row
 ├── summary_row.csv
 ├── report.md          # ends with "Why this is special" once the pitch is added
+├── commits.sha256.txt # one hashed id per commit (and Perforce changelist) with its day: safe to send
+├── own_files.sha256.txt # one hashed id per own-code file content with its lines: safe to send
 ├── dream.json         # the pitch, kept for re-runs
 ├── .private/          # settling list with folder, plugin and file names: for the studio only, never share
 └── .state/            # per-stage cache for resuming; delete before sharing
 ```
+
+### Commit and file ids (counting shared history once)
+
+A studio often holds the same history more than once: a fork, a copy on another host, a mirror, a second Perforce stream. Each run writes two compact lists next to `measure.json`:
+
+- `commits.sha256.txt`: one line per commit in the measured history (and per submitted Perforce changelist), `<id> <author day>`.
+- `own_files.sha256.txt`: one line per own-code file content (full mode), `<id> <own lines of code>`.
+
+Each id is the first 16 hex characters of `sha256(salt|kind|<commit sha, changelist or content id>)`. Pass the same `--commit-salt-file` to every repo of one studio (measure-studio keeps it at `<studio-out>/.state/commit-salt`); then the same commit or file has the same id in every repo, and the studio's manifest counts distinct commits and own lines across all of them. Without the flag, a salt is made for the run alone and nothing matches across repos. `measure.json` gains a `commit_ids` block (count, salt fingerprint, label); every older field is unchanged.
+
+**Safe to send.** The lists hold hashes, days and line counts only. The salt never leaves the studio's machine (it sits in a `.state/` folder that is never shared), so nobody can turn a line back into a commit or file, or match it to another studio's list. The salt fingerprint in the header only shows whether two lists used the same salt.
 
 See [`examples/`](examples/) for output built from **synthetic** data.
 

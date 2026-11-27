@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds throwaway synthetic git repos and checks full mode, simple mode, the census and task mining,
 # capacity, branch selection, the build probe, edge cases (empty, non-git, shallow), verification and
-# the output boundary, the status rules (a build nobody asked for is info, not partial) and dream mode.
+# the output boundary, the status rules (a build nobody asked for is info, not partial), dream mode, and the hashed
+# commit and own-file id lists across two repos that share history (a fork) under one studio salt.
 # Usage: bash tests/selftest.sh   (PY=/path/to/python3 to pick an interpreter)
 set -euo pipefail
 PY="${PY:-python3}"
@@ -125,7 +126,7 @@ import csv, json, sys, pathlib
 w = pathlib.Path(sys.argv[1])
 load = lambda p: json.loads((w / p / "measure.json").read_text())
 d = load("full")
-assert d["schema"] == "october.measure/v1" and d["kind"] == "code" and d["mode"] == "full" and d["tool_version"] == "0.5.0"
+assert d["schema"] == "october.measure/v1" and d["kind"] == "code" and d["mode"] == "full" and d["tool_version"] == "0.6.0"
 g = d["git"]
 assert g["commits"] == 9 and g["authors_human"] == 4 and g["authors_bot"] == 1, g
 assert g["pre_cutoff_commits"] == 2 and g["history_complete"] is True, g
@@ -495,4 +496,60 @@ assert json.loads((w / "o-people/measure.json").read_text())["perforce"]["status
 print("selftest: own code, Blueprints, settling, fresh upload and Perforce OK")
 PYEOF
 "$PY" "$M" "$U" --verify "$WORK/o-u/measure.json" >/dev/null
+
+# Distinct commits across a studio: two synthetic repos sharing history (a fork), hashed with one studio salt file.
+FA="$WORK/fork-a"; FB="$WORK/fork-b"; SALT="$WORK/studio/.state/commit-salt"
+mkdir -p "$FA/src" && cd "$FA" && git init -q -b main
+printf 'int add(int a, int b) { return a + b; }\n' > src/add.c
+commit_as "2021-05-01T10:00:00Z" "Dev One" "one@example.com" "start"
+printf 'int sub(int a, int b) { return a - b; }\n' > src/sub.c
+commit_as "2022-06-01T10:00:00Z" "Dev One" "one@example.com" "subtract"
+printf 'int mul(int a, int b) { return a * b; }\n' > src/mul.c
+commit_as "2023-01-15T10:00:00Z" "Dev Two" "two@example.com" "multiply"
+git clone -q "$FA" "$FB" && cd "$FB"
+printf 'int dvd(int a, int b) { return b ? a / b : 0; }\n' > src/div.c
+commit_as "2024-03-01T10:00:00Z" "Dev Three" "three@example.com" "divide in the fork"
+printf 'int neg(int a) { return -a; }\n' > src/neg.c
+commit_as "2025-02-01T10:00:00Z" "Dev Three" "three@example.com" "negate in the fork"
+cd "$WORK"
+"$PY" "$M" "$FA" --out "$WORK/fo-a" --label fork-a --no-dream --commit-salt-file "$SALT" >/dev/null 2>&1
+"$PY" "$M" "$FB" --out "$WORK/fo-b" --label fork-b --no-dream --commit-salt-file "$SALT" >/dev/null 2>&1
+"$PY" "$M" "$FB" --out "$WORK/fo-b-other" --label fork-b --no-dream >/dev/null 2>&1   # no studio salt file
+test -s "$SALT"
+"$PY" - "$WORK" "$FA" "$FB" <<'PYEOF'
+import json, subprocess, sys
+from pathlib import Path
+w, fa, fb = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+def ids(o, name="commits.sha256.txt"):
+    lines = (w / o / name).read_text().splitlines()
+    head = [l for l in lines if l.startswith("#")]
+    body = [l.split() for l in lines if l and not l.startswith("#")]
+    assert any(l.startswith("# salt-fingerprint: ") for l in head) and any("safe to send" in l for l in head), head
+    assert all(len(b[0]) == 16 and all(c in "0123456789abcdef" for c in b[0]) for b in body), body
+    return {b[0]: b[1] for b in body}, [l for l in head if l.startswith("# salt-fingerprint")][0]
+a, fpa = ids("fo-a"); b, fpb = ids("fo-b"); other, fpo = ids("fo-b-other")
+assert len(a) == 3 and len(b) == 5, (len(a), len(b))
+assert len(set(a) & set(b)) == 3 and len(set(a) | set(b)) == 5        # the fork's shared history counts once
+assert fpa == fpb and fpo != fpa and not set(other) & set(a)           # another salt: nothing matches
+assert sorted(b.values())[0] == "2021-05-01" and sum(d < "2022-11-30" for d in b.values()) == 2
+shas = subprocess.run(["git", "-C", fb, "log", "--format=%H"], capture_output=True, text=True).stdout.split()
+txt = (w / "fo-b/commits.sha256.txt").read_text()
+assert not any(s[:12] in txt for s in shas), "raw commit ids leaked"
+fa_files, _ = ids("fo-a", "own_files.sha256.txt"); fb_files, _ = ids("fo-b", "own_files.sha256.txt")
+assert len(fa_files) == 3 and len(fb_files) == 5 and len(set(fa_files) & set(fb_files)) == 3
+assert all(v == "1" for v in fb_files.values())                        # one own line per file
+d = json.loads((w / "fo-b/measure.json").read_text())
+ci = d["commit_ids"]
+assert ci["status"] == "written" and ci["count"] == 5 and ci["own_files"] == 5 and ci["label"] == "verified", ci
+assert ci["salt_source"] == "studio salt file" and fpb.endswith(ci["salt_fingerprint"])
+assert json.loads((w / "fo-b-other/measure.json").read_text())["commit_ids"]["salt_source"] == "this run only"
+assert "Commit ids: 5 hashed commit ids" in (w / "fo-b/report.md").read_text()
+assert d["git"]["commits"] == 5 and "salt" not in json.dumps(d["git"])  # old fields unchanged
+pf = json.loads((w / "o-u-p4/measure.json").read_text())["commit_ids"]
+assert pf["p4_changes"] == 4 and pf["count"] == len(ids("o-u-p4")[0]) >= 4, pf
+sh = json.loads((w / "o-shallow/measure.json").read_text())["commit_ids"]
+assert sh["status"] == "not_written" and sh["count"] is None and sh["label"] == "unknown", sh
+assert not (w / "o-shallow/commits.sha256.txt").exists()
+print("selftest: commit ids across a fork (3 shared, 5 distinct), own file ids, salts and Perforce OK")
+PYEOF
 echo "selftest: passed"
