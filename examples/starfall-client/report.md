@@ -168,7 +168,7 @@ Commits naming a ticket (label verified): 3,572 (38.0%); of them fixes 1,464. Pr
 
 Engine content tracked: uasset 0, umap 0, unity 62, prefab 932, tscn 0.
 
-Ownership: own (default (the seller owns its data)). Restriction flags (recorded, not ruled on):
+Ownership: own; basis: default (the seller owns its data). Restriction flags (recorded, not ruled on):
 
 | flag | value | label | basis |
 |---|---|---|---|
@@ -209,7 +209,7 @@ Code table (block E):
 
 ## Provenance
 
-- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `eb1ef42e0b72d3dc58f3387583034795`; payload digest `2dbd31347b3276ec8fb03c450ebe45d2`
+- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `97326fa9dc5f3bd4e1dd7b3957e0f0da`; payload digest `997977444dbd2992dd6576fcc459c23f`
 - A buyer can check these numbers on their own copy: `measure_code.py <repo> --verify measure.json`.
 
 ## Caveats

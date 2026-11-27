@@ -2432,7 +2432,7 @@ def people_section(doc: dict) -> list:
     fb = ec.get("files_by_type") or {}
     L += ["", "Engine content tracked: " + ", ".join(f"{k} {fmt(v)}" for k, v in fb.items()) + "."]
     if rs:
-        L += ["", f"Ownership: {rs.get('ownership')} ({rs.get('ownership_basis')}). Restriction flags (recorded, not ruled on):", "",
+        L += ["", f"Ownership: {rs.get('ownership')}; basis: {rs.get('ownership_basis')}. Restriction flags (recorded, not ruled on):", "",
               "| flag | value | label | basis |", "|---|---|---|---|"]
         for k, v in rs.get("flags", {}).items():
             val = "unknown" if v.get("value") is None else ("yes" if v["value"] else "no")
