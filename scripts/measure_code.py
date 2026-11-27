@@ -5,11 +5,13 @@ Two modes:
 
   --mode simple   listing and metadata only: history without file lists, a sampled
                   line count, path-based signals. No build, no blame, no review.
-                  Minutes even on large repos. Says whether a full run is worth it.
-  --mode full     (default) every lane: full history census, every file read,
-                  hygiene and sourcing signals, code age by blame, build probe
-                  (detect by default; discover/full execute repo code), and the
-                  optional reviewer census written with add_census.py.
+                  Minutes even on large repos. Every figure is marked as an
+                  estimate. Says whether a full run is worth it.
+  --mode full     (default) every lane: history census with lines changed per
+                  commit, every file read, hygiene and sourcing signals, code age
+                  by blame, build probe (detect by default; discover/full execute
+                  repo code), and the reviewer census and task mining written
+                  with add_census.py, which a full run requires.
 
 Writes into --out:
 
@@ -17,10 +19,14 @@ Writes into --out:
   summary_row.json/.csv one flat row per repository, for spreadsheets
   report.md             the same numbers for people
 
-No network calls are made by this script (build commands run with offline
-settings). Authors are counted, never named. Paths, commit messages, branch
-names and emails never reach the output: every string in the output must sit
-in a declared field, and the run refuses to write anything else.
+`--verify <measure.json>` re-measures a copy of the repository and checks the
+stable figures, fingerprints and digests of an existing measure.json.
+
+No network calls are made by this script unless you pass --install (build
+commands otherwise run with offline settings). Authors are counted, never
+named. Paths, commit messages, branch names and emails never reach the output:
+every string in the output must sit in a declared field, and the run refuses
+to write anything else.
 
 Each stage is cached under <out>/.state/ so an interrupted run resumes.
 Python 3.9+ standard library only.
@@ -44,7 +50,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 TOOL = "measure-code"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCHEMA = "october.measure/v1"
 SKETCH_K = 256
 TASK_KINDS = ("bugfix", "feature", "restructure", "exploratory")
@@ -211,10 +217,7 @@ LINT_FILES = {".eslintrc": "eslint", ".eslintrc.js": "eslint", ".eslintrc.json":
               ".stylelintrc": "stylelint", ".editorconfig": "editorconfig", ".clang-format": "clang-format",
               ".clang-tidy": "clang-tidy", ".rubocop.yml": "rubocop", "checkstyle.xml": "checkstyle",
               "biome.json": "biome", ".swiftlint.yml": "swiftlint", "tsconfig.json": "typescript"}
-AI_TRAILER_RX = re.compile(r"(claude|copilot|cursor|codex|chatgpt|openai|gemini|devin|aider|sweep|openhands|windsurf|codeium)", re.I)
-AI_AGENT_AUTHOR_RX = re.compile(r"(claude|copilot-swe|devin-ai|cursor-agent|codex|openhands|sweep-ai|google-labs-jules)", re.I)
 CONVENTIONAL_RX = re.compile(r"^(feat|fix|chore|docs|refactor|test|tests|perf|build|ci|style|revert)(\([^)]*\))?!?:")
-PR_RX = re.compile(r"(?:Merge pull request #(\d+)|\(#(\d+)\)\s*$|Merged in .*\(pull request #(\d+)\)|See merge request .*!(\d+))")
 SEED_RX = re.compile(r"(^|/)(seeds?|seeders?)(/|$)|(seed|seeder|sample[-_]?data|demo[-_]?data|fixtures?[-_]data)[^/]*\.(sql|json|csv|ya?ml|js|ts|py|rb|php)$", re.I)
 
 
@@ -255,34 +258,191 @@ def family_of(ext: str) -> str:
 # stage: git history
 # --------------------------------------------------------------------------
 
-BOT_RX = re.compile(r"(\[bot\]|^bot@|-bot@|dependabot|renovate|github-actions|gitlab-ci|noreply@.*ci|snyk)", re.I)
-FIX_RX = re.compile(r"\b(fix|fixes|fixed|bug|bugfix|hotfix|patch|crash|regression|issue)\b", re.I)
+BOT_RX = re.compile(r"(\[bot\]|^bot@|-bot@|^dependabot|^renovate|github-actions|gitlab-ci|^noreply@.*\bci\b|snyk-bot|^greenkeeper|^mergify|^pre-commit-ci)", re.I)
+# Fix detection: a fix verb after any tracker prefix ("Bug 123 -", "[ABC-12]", "#45:") is stripped,
+# and the diff must corroborate it (lines deleted in first-party source). "Bug 123 - add X" is not a fix.
+TRACKER_PREFIX_RX = re.compile(r"^\s*(?:\[[^\]]{1,40}\]\s*|(?:bug|issue|ticket|task)\s*#?\d+\s*[-:.]?\s*|[A-Z][A-Z0-9]{1,9}-\d+\s*[-:.]?\s*|#\d+\s*[-:.]?\s*)+", re.I)
+FIX_RX = re.compile(r"\b(fix(?:es|ed|ing)?|bug ?fix(?:es)?|hot ?fix(?:es)?|crash(?:es|ed|ing)?|regression|resolve[sd]? (?:a |the )?(?:bug|crash|issue|leak)|patch(?:es|ed)? (?:a |the )?(?:bug|crash|leak|hole))\b", re.I)
 FEAT_RX = re.compile(r"\b(feat|feature|add|adds|added|implement|implements|introduce|support)\b", re.I)
-REFAC_RX = re.compile(r"\b(refactor|cleanup|clean up|rename|restructure|migrate|upgrade|bump|deprecate)\b", re.I)
+REFAC_RX = re.compile(r"\b(refactor|cleanup|clean up|rename|restructure|migrate|upgrade|deprecate)\b", re.I)
 PERF_RX = re.compile(r"\b(perf|performance|optimi[sz]e|speed ?up|faster|cache)\b", re.I)
+# Chores that are never mineable work, whatever files they touch.
+NOISE_RX = re.compile(r"^\s*(merge\b|revert\b|wip\b|initial commit\b)|\b(bump|chore|typos?|whitespace|formatting|reformat|format code|lint(?:ing)? fix|prettier|"
+                      r"version bump|release v?\d|changelog|update (?:the )?readme|update dependenc|dependency update|deps\b|"
+                      r"auto-?generated|regenerate|sync(?:ed)? with upstream)\b", re.I)
+# AI tools: known agent addresses match anywhere; product names match only the NAME part of an identity.
+# A bare first name (Claude, Cursor, Gemini, Devin, Jules) is never enough on its own.
+AI_EMAIL_RX = re.compile(
+    r"^(noreply@anthropic\.com|claude@anthropic\.com|copilot@github\.com|cursoragent@cursor\.com|agent@cursor\.com|"
+    r"codex@openai\.com|aider@aider\.chat|openhands@all-hands\.dev|"
+    r"\d+\+(claude|copilot|copilot-swe-agent|devin-ai-integration|gemini-code-assist|google-labs-jules|openhands-agent|"
+    r"sweep-ai|chatgpt-codex-connector|cursor)(\[bot\])?@users\.noreply\.github\.com)$", re.I)
+AI_NAME_RX = re.compile(
+    r"^(claude (code|opus|sonnet|haiku|\d)[\w .-]*|claude\[bot\]|github copilot|copilot|copilot-swe-agent(\[bot\])?|"
+    r"cursor agent|cursoragent|cursor-agent|openai codex|codex( cli| agent)?|chatgpt( codex)?|chatgpt-codex-connector(\[bot\])?|"
+    r"gemini code assist|gemini-code-assist(\[bot\])?|google-labs-jules(\[bot\])?|devin ai|devin-ai-integration(\[bot\])?|"
+    r"aider( \([^)]*\))?|openhands(-agent)?|sweep(-ai)?(\[bot\])?|windsurf( agent)?|codeium)$", re.I)
+IDENT_RX = re.compile(r"^\s*(.*?)\s*<([^>]*)>\s*$")
+PR_SUBJECT_RX = re.compile(r"^Merge pull request #(\d+)\b|^Merged in .*\(pull request #(\d+)\)")
+PR_SQUASH_RX = re.compile(r"\(#(\d+)\)\s*$")
+MR_BODY_RX = re.compile(r"See merge request \S+!(\d+)")
 
 
-def commit_kind(subject: str) -> str:
-    if FIX_RX.search(subject):
+def ai_identity(name: str, email: str) -> bool:
+    return bool(AI_EMAIL_RX.match((email or "").strip()) or AI_NAME_RX.match((name or "").strip()))
+
+
+def ai_trailer(value: str) -> bool:
+    for part in (value or "").split("\x1d"):
+        m = IDENT_RX.match(part)
+        name, email = (m.group(1), m.group(2)) if m else (part, "")
+        if ai_identity(name, email):
+            return True
+    return False
+
+
+def commit_kind(subject: str, impl_deleted: int = 0, impl_files: int = 0) -> str:
+    """Strict kinds. A fix needs a fix verb (after tracker prefixes) AND deleted lines in first-party source."""
+    s = TRACKER_PREFIX_RX.sub("", subject or "")
+    if FIX_RX.search(s) and impl_files and impl_deleted > 0:
         return "bugfix"
-    if PERF_RX.search(subject) or REFAC_RX.search(subject):
+    if PERF_RX.search(s) or REFAC_RX.search(s):
         return "restructure"
-    if FEAT_RX.search(subject):
+    if FEAT_RX.search(s):
         return "feature"
     return "exploratory"
 
 
-def stage_git(repo: Path, cutoff: str, all_refs: bool, with_files: bool) -> dict:
-    """with_files=False is the simple-mode path: no per-commit file lists, so no task census."""
+# Capacity: one mineable commit = non-merge, non-bot, not a chore, 2+ first-party non-test source files,
+# 20-8,000 lines changed in first-party source, at most 40 files and 5 directories.
+CAPACITY_RULE = {"min_impl_files": 2, "max_files": 40, "max_dirs": 5, "min_churn": 20, "max_churn": 8000}
+TASK_RULE = {"max_files": 30, "max_dirs": 4, "min_churn": 10, "max_churn": 8000}
+
+
+def repo_state(repo: Path) -> dict:
+    """is_git, has_commits, subtree (repo is a folder inside a larger work tree)."""
+    st = {"is_git": False, "has_commits": False, "subtree": False}
+    try:
+        git(repo, "rev-parse", "--git-dir")
+    except (RuntimeError, OSError):
+        return st
+    st["is_git"] = True
+    try:
+        top = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
+        st["subtree"] = top != repo.resolve()
+    except RuntimeError:
+        pass
+    try:
+        git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+        st["has_commits"] = True
+    except RuntimeError:
+        pass
+    return st
+
+
+def choose_ref(repo: Path, policy: str, pathspec: list, max_refs: int = 200) -> dict:
+    """Find where the real history lives. Counts commits on HEAD and on every local and remote branch
+    (no names are kept). policy auto measures the deepest branch when it is clearly deeper than HEAD."""
+    def count(rev):
+        try:
+            return int(git(repo, "rev-list", "--count", rev, *pathspec).strip() or 0)
+        except RuntimeError:
+            return 0
+    head = count("HEAD")
+    out = {"policy": policy, "refs_considered": 0, "head_commits": head, "deepest_ref_commits": head,
+           "measured": "head", "measured_commits": head, "_rev": ["HEAD"]}
+    if policy == "all":
+        out.update(measured="all_refs", _rev=["--all"], measured_commits=count("--all"))
+        return out
+    try:
+        raw = git(repo, "for-each-ref", "--sort=-committerdate", "--format=%(objectname) %(objecttype)", "refs/heads", "refs/remotes")
+    except RuntimeError:
+        raw = ""
+    shas = []
+    for line in raw.splitlines():
+        sha, _, typ = line.partition(" ")
+        if typ == "commit" and sha not in shas:
+            shas.append(sha)
+    shas = shas[:max_refs]
+    out["refs_considered"] = len(shas)
+    best_sha, best = None, head
+    for sha in shas:
+        n = count(sha)
+        if n > best:
+            best_sha, best = sha, n
+    out["deepest_ref_commits"] = best
+    out["deeper_ref_exists"] = best_sha is not None and best >= head * 1.25 and best - head >= 10
+    if policy == "auto" and out["deeper_ref_exists"]:
+        out.update(measured="deepest_branch", measured_commits=best, _rev=[best_sha])
+    return out
+
+
+HISTORY_KEYS_KEPT_WHEN_SHALLOW = {"commits", "merge_commits", "non_merge_commits", "last_commit", "recency_days", "tags",
+                                  "semver_tags", "branches", "history_shallow", "history_single_commit", "history_complete",
+                                  "history_note"}
+
+
+def null_history(g: dict, note: str) -> dict:
+    """Shallow clones: history-derived counts and shares would describe a truncated history, so they are nulled."""
+    for k in list(g):
+        if k.startswith("_") or k in HISTORY_KEYS_KEPT_WHEN_SHALLOW:
+            continue
+        g[k] = None
+    g["history_complete"] = False
+    g["history_note"] = note
+    g["_task_signals"] = None
+    return g
+
+
+def empty_history(reason: str) -> dict:
+    keys = ("merge_commits", "non_merge_commits", "authors_human", "authors_bot", "bot_commits", "authors_with_10plus_commits",
+            "top1_author_share", "top5_author_share", "first_commit", "last_commit", "span_days", "recency_days", "active_days",
+            "active_months", "commits_by_year", "commits_by_month", "pre_cutoff_commits", "pre_cutoff_share",
+            "commits_last_12_months", "tags", "semver_tags", "branches", "root_commit_count", "history_shallow",
+            "conventional_commit_share_last_200", "pr_merged_count", "ai_coauthored_commits", "ai_agent_commits", "ai_assisted_share")
+    g = {k: None for k in keys}
+    g.update(commits=0 if reason == "no_commits" else None, history_single_commit=False, history_complete=False,
+             history_note=reason, _root_commit_files=None, _fingerprints={"root_commits": [], "commit_sketch": []},
+             _task_signals=None)
+    return g
+
+
+def count_prs(repo: Path, rev: list, pathspec: list):
+    """Merged PRs on first-parent history only. A trailing (#N) counts only when the hosting service committed it."""
     sep, rec = "\x1f", "\x1e"
-    fmt = rec + sep.join(["%H", "%P", "%ae", "%an", "%at", "%ct", "%ce", "%s",
+    try:
+        raw = git(repo, "log", "--first-parent", f"--format={rec}%s{sep}%cn{sep}%ce{sep}%b", *rev, *pathspec)
+    except RuntimeError:
+        return None
+    prs = set()
+    for block in raw.split(rec):
+        f = block.split(sep)
+        if len(f) < 4:
+            continue
+        subject, cname, cemail, body = f[0], f[1], f[2].strip().lower(), f[3]
+        m = PR_SUBJECT_RX.search(subject)
+        if m:
+            prs.add(next(x for x in m.groups() if x))
+            continue
+        m = PR_SQUASH_RX.search(subject)
+        if m and (cemail == "noreply@github.com" or cname.strip() == "GitHub"):
+            prs.add(m.group(1))
+            continue
+        m = MR_BODY_RX.search(body)
+        if m:
+            prs.add("mr" + m.group(1))
+    return len(prs)
+
+
+def stage_git(repo: Path, cutoff: str, rev: list, with_files: bool, pathspec: list) -> dict:
+    """with_files=False is the simple-mode path: no per-commit line counts, so no task census or capacity."""
+    sep, rec = "\x1f", "\x1e"
+    fmt = rec + sep.join(["%H", "%P", "%ae", "%an", "%at", "%ct", "%ce", "%cn", "%s",
                           "%(trailers:key=Co-authored-by,valueonly,separator=%x1d)"])
     args = ["log", f"--format={fmt}", "--date-order"]
     if with_files:
-        args += ["--name-only", "--no-renames"]
-    if all_refs:
-        args.append("--all")
-    raw = git(repo, *args)
+        args += ["--numstat", "--no-renames"]
+    raw = git(repo, *args, *rev, *pathspec)
     cutoff_ts = dt.datetime.strptime(cutoff, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc).timestamp()
     commits = merges = bot_commits = pre_cutoff = 0
     roots, shas, root_files = [], [], 0
@@ -293,23 +453,28 @@ def stage_git(repo: Path, cutoff: str, all_refs: bool, with_files: bool) -> dict
     first_ts = last_ts = None
     task = Counter()
     ai_coauthored = ai_agent = 0
-    prs = set()
     conventional = recent_subjects = 0
     for block in raw.split(rec):
         if not block.strip():
             continue
         head, _, files_blob = block.partition("\n")
         fields = head.split(sep)
-        if len(fields) < 9:
+        if len(fields) < 10:
             continue
-        sha, parents, email, name, at, ct, cemail, subject, trailers = fields[:9]
+        sha, parents, email, name, at, ct, cemail, cname, subject, trailers = fields[:10]
         commits += 1
         shas.append(sha)
         plist = parents.split()
-        files = [f for f in files_blob.splitlines() if f.strip()] if with_files else []
+        changes = []
+        if with_files:
+            for line in files_blob.splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    a_, d_, path = parts
+                    changes.append((path, int(a_) if a_.isdigit() else 0, int(d_) if d_.isdigit() else 0))
         if not plist:
             roots.append(sha)
-            root_files += len(files)
+            root_files += len(changes)
         is_merge = len(plist) > 1
         merges += is_merge
         ts = float(at or ct or 0)
@@ -320,13 +485,10 @@ def stage_git(repo: Path, cutoff: str, all_refs: bool, with_files: bool) -> dict
         by_month[d.strftime("%Y-%m")] += 1
         days.add(d.strftime("%Y-%m-%d"))
         pre_cutoff += ts < cutoff_ts
-        if trailers and AI_TRAILER_RX.search(trailers):
+        if trailers and ai_trailer(trailers):
             ai_coauthored += 1
-        if AI_AGENT_AUTHOR_RX.search(email) or AI_AGENT_AUTHOR_RX.search(name) or AI_AGENT_AUTHOR_RX.search(cemail):
+        if ai_identity(name, email) or ai_identity(cname, cemail):
             ai_agent += 1
-        m = PR_RX.search(subject)
-        if m:
-            prs.add(next(g for g in m.groups() if g))
         if not is_merge and recent_subjects < 200:
             recent_subjects += 1
             conventional += bool(CONVENTIONAL_RX.match(subject))
@@ -337,28 +499,54 @@ def stage_git(repo: Path, cutoff: str, all_refs: bool, with_files: bool) -> dict
         per_author[h(email.strip().lower() or name.strip().lower())] += 1
         if is_merge or not with_files:
             continue
-        src = [f for f in files if Path(f).suffix.lower() in LANG_BY_EXT and not vendor_kind(f)]
-        tests = [f for f in src if is_test_path(f)]
-        src_only = [f for f in src if not is_test_path(f)]
-        kind = commit_kind(subject)
+        src = [c for c in changes if Path(c[0]).suffix.lower() in LANG_BY_EXT and not vendor_kind(c[0])]
+        tests = [c for c in src if is_test_path(c[0])]
+        impl = [c for c in src if not is_test_path(c[0])]
+        churn = sum(c[1] + c[2] for c in src)
+        dirs = len({str(Path(c[0]).parent) for c in src})
+        noise = bool(NOISE_RX.search(subject))
+        kind = commit_kind(subject, sum(c[2] for c in impl), len(impl))
         task[f"{kind}_commits"] += 1
-        if tests and src_only and 0 < len(files) <= 20:
+        task["lines_changed_first_party"] += churn
+        if FIX_RX.search(TRACKER_PREFIX_RX.sub("", subject)) and kind != "bugfix":
+            task["fix_subject_not_corroborated"] += 1
+        if noise:
+            task["chore_commits"] += 1
+            continue
+        if len(tests) >= 5 and len(impl) < 3:
+            task["bulk_test_commits"] += 1
+        cr = CAPACITY_RULE
+        if (len(impl) >= cr["min_impl_files"] and len(src) <= cr["max_files"] and dirs <= cr["max_dirs"]
+                and cr["min_churn"] <= churn <= cr["max_churn"]):
+            task["mineable_commits"] += 1
+            task[f"{kind}_mineable"] += 1
+        elif len(src) > cr["max_files"] or dirs > cr["max_dirs"]:
+            task["too_spread_commits"] += 1
+        tr = TASK_RULE
+        in_band = impl and len(src) <= tr["max_files"] and dirs <= tr["max_dirs"] and tr["min_churn"] <= churn <= tr["max_churn"]
+        if in_band and tests:
             task["with_tests_total"] += 1
             task[f"{kind}_with_tests"] += 1
-        elif src_only and 0 < len(files) <= 20:
+            if kind == "bugfix":
+                task["bugfix_with_regression_test"] += 1
+        elif in_band:
             task[f"{kind}_source_only"] += 1
     counts = sorted(per_author.values(), reverse=True)
     total_h = sum(counts) or 1
     try:
         shallow = git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
+    except RuntimeError:
+        shallow = None
+    try:
         tag_names = [t for t in git(repo, "tag", "--list").splitlines() if t.strip()]
         branches = len([b for b in git(repo, "branch", "--all", "--format=%(refname)").splitlines() if b.strip()])
         since = (dt.datetime.fromtimestamp(last_ts or time.time(), tz=dt.timezone.utc) - dt.timedelta(days=365)).timestamp()
-        last12 = int(git(repo, "rev-list", "--count", f"--since={int(since)}", "--all" if all_refs else "HEAD").strip() or 0)
+        last12 = int(git(repo, "rev-list", "--count", f"--since={int(since)}", *rev, *pathspec).strip() or 0)
     except RuntimeError:
-        shallow, tag_names, branches, last12 = None, [], None, None
+        tag_names, branches, last12 = [], None, None
     today = dt.datetime.now(dt.timezone.utc)
-    return {
+    single = commits == 1
+    g = {
         "commits": commits, "merge_commits": merges, "non_merge_commits": commits - merges,
         "authors_human": len(counts), "authors_bot": len(bot_authors), "bot_commits": bot_commits,
         "authors_with_10plus_commits": sum(1 for c in counts if c >= 10),
@@ -369,18 +557,22 @@ def stage_git(repo: Path, cutoff: str, all_refs: bool, with_files: bool) -> dict
         "recency_days": int((today.timestamp() - last_ts) / 86400) if last_ts else None,
         "active_days": len(days), "active_months": len(by_month),
         "commits_by_year": dict(sorted(by_year.items())), "commits_by_month": dict(sorted(by_month.items())),
-        "pre_cutoff_commits": pre_cutoff, "pre_cutoff_share": round(pre_cutoff / commits, 3) if commits else None,
+        "pre_cutoff_commits": pre_cutoff, "pre_cutoff_share": round(pre_cutoff / commits, 3) if commits and not single else None,
         "commits_last_12_months": last12, "tags": len(tag_names),
         "semver_tags": sum(1 for t in tag_names if re.match(r"^v?\d+\.\d+(\.\d+)?", t)), "branches": branches,
-        "root_commit_count": len(roots), "history_shallow": shallow, "history_single_commit": commits == 1,
+        "root_commit_count": len(roots), "history_shallow": shallow, "history_single_commit": single,
+        "history_complete": not shallow and not single, "history_note": "single-commit snapshot" if single else None,
         "conventional_commit_share_last_200": round(conventional / recent_subjects, 3) if recent_subjects else None,
-        "pr_merged_count": len(prs) if not shallow else None,
+        "pr_merged_count": count_prs(repo, rev, pathspec),
         "ai_coauthored_commits": ai_coauthored, "ai_agent_commits": ai_agent,
-        "ai_assisted_share": round((ai_coauthored + ai_agent) / commits, 3) if commits else None,
+        "ai_assisted_share": round((ai_coauthored + ai_agent) / commits, 3) if commits and not single else None,
         "_root_commit_files": root_files if with_files else None,
         "_fingerprints": {"root_commits": sorted(h("root:" + r) for r in roots), "commit_sketch": bottom_k(shas)},
         "_task_signals": dict(task) if with_files else None,
     }
+    if shallow:
+        null_history(g, "shallow clone: history is truncated, so history-derived counts and shares are not reported")
+    return g
 
 
 # --------------------------------------------------------------------------
@@ -580,6 +772,8 @@ def stage_tree(repo: Path, sample: int | None, seed: int = 7) -> dict:
         "mode_note": scale_note,
         "languages": {k: dict(v) for k, v in sorted(langs.items(), key=lambda kv: -kv[1]["code_lines"])},
         "code_lines_total": code_total,
+        "code_lines_definition": "non-blank lines that are not comments, tracked first-party files",
+        "nonblank_lines_total": code_total + sum(v["comment_lines"] for v in langs.values()),
         "comment_lines_total": sum(v["comment_lines"] for v in langs.values()),
         "source_files": sum(v["files"] for v in langs.values()) - sum(v.get("test_files", 0) for v in langs.values()),
         "tracked_files": len(files),
@@ -597,6 +791,7 @@ def stage_tree(repo: Path, sample: int | None, seed: int = 7) -> dict:
         "_logic": {"functions_estimate": functions, "branch_points": branches,
                    "branches_per_kloc": round(branches / (sum(src_sizes) / 1000), 1) if sum(src_sizes) else None,
                    "max_nesting_levels": pct(nestings, 0.95) or 0, "files_nesting_5plus": deep,
+                   "files_nesting_5plus_share": round(deep / len(nestings), 3) if nestings else None,
                    "top_level_modules": len(top_dirs), "source_code_lines": src_code},
         "_authenticity": {"comment_ratio_median": round(pct(sorted(comment_ratios), 0.5), 3) if comment_ratios else None,
                           "llm_phrase_hits": llm_markers, "generated_marker_files": generated_markers},
@@ -609,6 +804,17 @@ def stage_tree(repo: Path, sample: int | None, seed: int = 7) -> dict:
 # --------------------------------------------------------------------------
 # stage: repository signals (docs, hygiene, CI, dependencies, frameworks)
 # --------------------------------------------------------------------------
+
+
+DEMO_PHRASES = {  # explicit statements in the README, not single words
+    "generator_boilerplate": r"bootstrapped with \[?create[- ]react[- ]app|this template should help|generated by create-next-app|"
+                             r"this project was generated with \[?angular cli",
+    "template_or_starter": r"\bthis (?:is an? )?(?:project |repo(?:sitory)? )?(?:is )?(?:a |an )?(?:simple )?(?:template|starter|boilerplate)\b|"
+                           r"\b(?:starter|template) (?:kit|project|repo(?:sitory)?) for\b|use this template",
+    "tutorial_or_course": r"\b(?:follow(?:ing)? (?:along )?(?:with )?(?:the|this|a) tutorial|tutorial series|course project|"
+                          r"homework|class assignment|bootcamp)\b",
+    "hello_world": r"\bhello,? world\b",
+}
 
 
 def stage_signals(repo: Path) -> dict:
@@ -697,9 +903,65 @@ def stage_signals(repo: Path) -> dict:
                                                                 ("turbo", "turbo.json"), ("rush", "rush.json"), ("go-work", "go.work")) if f in names}
                                                   | ({"npm-workspaces"} if '"workspaces"' in manifests_text else set())),
                        "package_roots": len({str(Path(p).parent) for p in names if Path(p).name in ("package.json", "pyproject.toml", "go.mod", "Cargo.toml", "pom.xml") and not vendor_kind(p)})},
-        "demo_words": {w: True for w in ("tutorial", "boilerplate", "starter", "template", "course", "homework", "example project", "hello world")
-                       if w in readme_text.lower()},
+        "demo_words": {k: True for k, rx in DEMO_PHRASES.items() if re.search(rx, readme_text, re.I)},
+        "scaffolds": scaffold_hits(names),
     }
+
+
+# Test runners only (never app frameworks): (name, manifest regex, config file names)
+TEST_RUNNERS = [
+    ("pytest", r"\bpytest\b", ("pytest.ini", "conftest.py")),
+    ("jest", r"[\"']jest[\"']\s*:", ("jest.config.js", "jest.config.ts", "jest.config.cjs", "jest.config.mjs")),
+    ("vitest", r"[\"']vitest[\"']\s*:", ("vitest.config.ts", "vitest.config.js", "vitest.config.mts")),
+    ("mocha", r"[\"']mocha[\"']\s*:", (".mocharc.json", ".mocharc.js", ".mocharc.yml")),
+    ("jasmine", r"[\"']jasmine[\"']\s*:", ("jasmine.json",)),
+    ("karma", r"[\"']karma[\"']\s*:", ("karma.conf.js",)),
+    ("playwright", r"@playwright/test", ("playwright.config.ts", "playwright.config.js")),
+    ("cypress", r"[\"']cypress[\"']\s*:", ("cypress.config.ts", "cypress.config.js", "cypress.json")),
+    ("junit", r"junit-jupiter|<artifactId>junit</artifactId>|junit:junit|org\.junit", ()),
+    ("testng", r"\btestng\b", ("testng.xml",)),
+    ("nunit", r"\bNUnit\b", ()),
+    ("xunit", r"\bxunit\b", ()),
+    ("mstest", r"MSTest\.TestFramework", ()),
+    ("unity-test-framework", r"com\.unity\.test-framework", ()),
+    ("phpunit", r"phpunit/phpunit", ("phpunit.xml", "phpunit.xml.dist")),
+    ("rspec", r"\brspec\b", (".rspec",)),
+    ("minitest", r"\bminitest\b", ()),
+    ("gut", r"", ("addons/gut/plugin.cfg",)),
+    ("googletest", r"\bgtest\b|GTest::|googletest", ()),
+    ("catch2", r"\bCatch2\b", ()),
+    ("flutter_test", r"flutter_test:", ()),
+]
+
+
+def detect_test_frameworks(repo: Path, names: list) -> list:
+    """Test tools named by manifests, config files or test-file conventions. App frameworks never appear here."""
+    first_party = [p for p in names if not vendor_kind(p)]
+    base = {Path(p).name for p in first_party}
+    text = ""
+    for p in first_party:
+        n = Path(p).name
+        if n in ("package.json", "pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.cfg", "setup.py", "tox.ini",
+                 "Pipfile", "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile", "composer.json", "pubspec.yaml",
+                 "CMakeLists.txt", "manifest.json", "packages.config") or n.endswith(".csproj"):
+            text += (read_text(repo / p, 200_000) or "") + "\n"
+    found = set()
+    for name, rx, cfgs in TEST_RUNNERS:
+        if (rx and re.search(rx, text)) or any(c in base or c in first_party for c in cfgs):
+            found.add(name)
+    tests = [p for p in first_party if is_test_path(p)]
+    if any(p.endswith("_test.go") for p in tests):
+        found.add("go-test")
+    if "Cargo.toml" in base and (any(p.endswith(".rs") for p in tests) or "#[test]" in "".join(
+            (read_text(repo / p, 100_000) or "") for p in first_party if p.endswith(".rs"))[:5_000_000]):
+        found.add("cargo-test")
+    if "mix.exs" in base and any(p.endswith("_test.exs") for p in tests):
+        found.add("exunit")
+    py_tests = [p for p in tests if p.endswith(".py")]
+    if py_tests and "pytest" not in found:
+        if any(re.search(r"^\s*(import unittest|from unittest)", read_text(repo / p, 50_000) or "", re.M) for p in py_tests[:50]):
+            found.add("unittest")
+    return sorted(found)
 
 
 # --------------------------------------------------------------------------
@@ -708,20 +970,52 @@ def stage_signals(repo: Path) -> dict:
 
 OFFLINE_ENV = {"CI": "1", "GOFLAGS": "-mod=mod", "GOPROXY": "off", "CARGO_NET_OFFLINE": "true", "npm_config_offline": "true",
                "PIP_NO_INDEX": "1", "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "NUGET_PACKAGES": os.environ.get("NUGET_PACKAGES", "")}
-BUILD_CMDS = {
-    "npm": (["npm", "run", "build", "--if-present"], ["npm", "test", "--silent"]),
-    "python": ([sys.executable, "-m", "compileall", "-q", "."], [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]),
-    "go": (["go", "build", "./..."], ["go", "test", "-v", "./..."]),
-    "cargo": (["cargo", "build", "--offline"], ["cargo", "test", "--offline"]),
-    "maven": (["mvn", "-o", "-q", "compile"], ["mvn", "-o", "test"]),
-    "gradle": (["./gradlew", "--offline", "assemble"], ["./gradlew", "--offline", "test"]),
-    "dotnet": (["dotnet", "build", "--no-restore"], ["dotnet", "test", "--no-restore", "--no-build"]),
+CREDENTIAL_ENV_RX = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|^AWS_|^GH_|^GITHUB_|^NPM_|^PYPI_|^AZURE_|^GOOGLE_APPLICATION)", re.I)
+RUNNER_ORDER = ("npm", "python", "go", "cargo", "dotnet", "maven", "gradle")
+RUNNER_MANIFESTS = {"package.json": "npm", "pyproject.toml": "python", "setup.py": "python", "requirements.txt": "python",
+                    "go.mod": "go", "Cargo.toml": "cargo", "pom.xml": "maven", "build.gradle": "gradle", "build.gradle.kts": "gradle"}
+BUILD_CMDS = {  # (build, test, list tests)
+    "npm": (["npm", "run", "build", "--if-present"], ["npm", "test", "--silent"], None),
+    "python": (["{py}", "-m", "compileall", "-q", "-x", r"[/\\](tests?|testing|test_?data|fixtures?)[/\\]", "."], ["{py}", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+               ["{py}", "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"]),
+    "go": (["go", "build", "./..."], ["go", "test", "-v", "./..."], ["go", "test", "-list", ".", "./..."]),
+    "cargo": (["cargo", "build", "--offline"], ["cargo", "test", "--offline"], ["cargo", "test", "--offline", "--", "--list"]),
+    "maven": (["mvn", "-o", "-q", "compile"], ["mvn", "-o", "test"], None),
+    "gradle": (["./gradlew", "--offline", "assemble"], ["./gradlew", "--offline", "test"], None),
+    "dotnet": (["dotnet", "build", "--no-restore"], ["dotnet", "test", "--no-restore", "--no-build"],
+               ["dotnet", "test", "--no-restore", "--no-build", "--list-tests"]),
 }
 RESULT_PARSERS = [  # (passed, failed) from a test runner's summary, counts only
     (re.compile(r"(\d+) passed"), re.compile(r"(\d+) failed")),                                  # pytest, jest, vitest
     (re.compile(r"test result: \w+\. (\d+) passed"), re.compile(r"; (\d+) failed")),            # cargo
     (re.compile(r"Passed:\s+(\d+)"), re.compile(r"Failed:\s+(\d+)")),                             # dotnet
 ]
+# Failure attribution. ENVIRONMENT = this machine lacks a tool, package, SDK or network; the repo is not blamed.
+ENV_FAILURE_RX = re.compile(
+    r"(command not found|is not recognized as an internal|No module named|ModuleNotFoundError|Cannot find module|MODULE_NOT_FOUND|"
+    r"ERR_MODULE_NOT_FOUND|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|getaddrinfo|network is unreachable|could not resolve host|"
+    r"module lookup disabled|GOPROXY=off|cannot find module providing|no required module provides|missing go\.sum entry|"
+    r"no matching package named|failed to download|attempting to make an HTTP request, but --offline|Could not resolve dependencies|"
+    r"Could not resolve all|Cannot access .* in offline mode|JAVA_HOME|No Java runtime|Unable to locate a Java|"
+    r"compatible \.NET SDK was not found|Unable to find package|NU1101|NU1301|assets file .* not found|pkg-config|"
+    r"EBADENGINE|Unsupported engine|requires a different Python|xcrun: error|cannot open shared object file|"
+    r"fatal error: [^\n]*: No such file or directory|ImportError: lib|sh: \S+: not found|env: \S+: No such file|"
+    r"dyld\[\d+\]: |dyld: Library not loaded|Bad CPU type in executable)", re.I)
+REPO_FAILURE_RX = re.compile(
+    r"(SyntaxError|IndentationError|TabError|error TS\d+|error\[E\d+\]|cannot find symbol|COMPILATION ERROR|BUILD FAILED|"
+    r"undefined: |syntax error|error CS\d+|TypeError|ReferenceError|NameError|AssertionError|AttributeError|--- FAIL|"
+    r"\bFAILED\b|Tests? failed|\d+ failed|error: could not compile)", re.I)
+NO_TEST_SCRIPT_RX = re.compile(r"(Missing script: \"?test|no test specified|no tests ran|collected 0 items|no test files)", re.I)
+
+
+def classify_failure(text: str, timed_out: bool) -> str:
+    if timed_out:
+        return "timeout"
+    if ENV_FAILURE_RX.search(text or ""):
+        return "environment"
+    if REPO_FAILURE_RX.search(text or ""):
+        return "repo"
+    return "unknown"
 
 
 def parse_results(text: str, runner: str):
@@ -738,11 +1032,208 @@ def parse_results(text: str, runner: str):
         ps = [int(x) for x in prx.findall(text)]
         if ps:
             return sum(ps) if runner == "cargo" else ps[-1], sum(int(x) for x in frx.findall(text)) if runner == "cargo" else int((frx.findall(text) or [0])[-1])
+    if runner == "python":
+        fs = re.findall(r"(\d+) failed", text)
+        if fs:
+            return 0, int(fs[-1])
     return None, None
 
 
-def stage_build(repo: Path, level: str, timeout: int, signals: dict, tests: dict) -> dict:
-    names = {p for p, _ in list_files(repo)}
+def parse_listed(text: str, runner: str):
+    """Number of tests a runner lists without running them."""
+    if runner == "python":
+        m = re.findall(r"(\d+) tests? collected|collected (\d+) items?", text)
+        if m:
+            return int(next(x for x in m[-1] if x))
+        n = len(re.findall(r"^\S+::\S+", text, re.M))
+        return n if n else (0 if "no tests collected" in text.lower() else None)
+    if runner == "go":
+        return len(re.findall(r"^(Test|Benchmark|Example|Fuzz)\w*$", text, re.M))
+    if runner == "cargo":
+        return len(re.findall(r": (test|bench)$", text, re.M))
+    if runner == "dotnet":
+        _, _, tail = text.partition("The following Tests are available:")
+        return len([x for x in tail.splitlines() if x.startswith((" ", "\t")) and x.strip()]) if tail else None
+    return None
+
+
+RUNNER_EXTS = {"npm": {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".vue", ".svelte"}, "python": {".py"},
+               "go": {".go"}, "cargo": {".rs"}, "dotnet": {".cs", ".fs", ".vb"}, "maven": {".java", ".kt", ".scala", ".groovy"},
+               "gradle": {".java", ".kt", ".scala", ".groovy"}}
+
+
+def project_roots(names: list) -> list:
+    """(folder, runner, source files under it), largest first. Nested roots of the same runner are left to their parent."""
+    by_dir = defaultdict(set)
+    for p in names:
+        if vendor_kind(p):
+            continue
+        n = Path(p).name
+        runner = RUNNER_MANIFESTS.get(n) or ("dotnet" if n.endswith((".sln", ".csproj")) else None)
+        if runner:
+            by_dir[Path(p).parent.as_posix()].add(runner)
+    roots = []
+    for d, runners in by_dir.items():
+        prefix = "" if d == "." else d + "/"
+        for runner in (r for r in RUNNER_ORDER if r in runners):
+            if runner == "gradle" and "maven" in runners:
+                continue
+            if any(o != d and (o == "." or d.startswith(o + "/")) and runner in rs for o, rs in by_dir.items()):
+                continue  # a nested project of the same kind is built by its parent
+            exts = RUNNER_EXTS[runner]
+            weight = sum(1 for p in names if p.startswith(prefix) and Path(p).suffix.lower() in exts and not vendor_kind(p))
+            roots.append((d, runner, weight))
+    roots.sort(key=lambda r: (-r[2], r[0].count("/"), r[0]))
+    return roots
+
+
+def build_env(scratch_home: str | None) -> dict:
+    env = {k: v for k, v in os.environ.items() if not CREDENTIAL_ENV_RX.search(k)}
+    env.update(OFFLINE_ENV)
+    if scratch_home:
+        env.update(HOME=scratch_home, XDG_CACHE_HOME=os.path.join(scratch_home, ".cache"), npm_config_userconfig=os.path.join(scratch_home, ".npmrc"))
+    return env
+
+
+def probe_root(repo: Path, rel: str, runner: str, level: str, timeout: int, install: bool, scratch: str | None,
+               test_tools: list) -> dict:
+    cwd = repo if rel == "." else repo / rel
+    r = {"runner": runner, "depth": 0 if rel == "." else rel.count("/") + 1, "status": None, "failure_class": None,
+         "dependencies_present": None, "install_attempted": False, "install_ok": None, "build_ok": None,
+         "tests_collected": None, "tests_ran": None, "tests_passed": None, "tests_failed": None, "timed_out": False, "seconds": 0}
+    t0 = time.time()
+    py = sys.executable
+    env = build_env(scratch)
+
+    def run(cmd, extra_env=None, t=timeout):
+        cmd = [py if c == "{py}" else c for c in cmd]
+        try:
+            e = {k: v for k, v in {**env, **(extra_env or {})}.items() if v is not None}
+            pr = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=t, check=False, env=e)
+            return pr.returncode, (pr.stdout + pr.stderr).decode("utf-8", "replace")[-200_000:]
+        except subprocess.TimeoutExpired:
+            r["timed_out"] = True
+            return None, ""
+        except OSError as e:
+            return None, f"command not found: {type(e).__name__}"
+
+    build_cmd, test_cmd, list_cmd = BUILD_CMDS[runner]
+    tool = build_cmd[0]
+    if runner == "gradle" and not (cwd / "gradlew").exists():
+        build_cmd, test_cmd = (["gradle", "--offline", "assemble"], ["gradle", "--offline", "test"])
+        tool = "gradle"
+    if tool not in ("{py}",) and not tool.startswith("./") and shutil.which(tool) is None:
+        r.update(status="environment_missing", failure_class="environment")
+        return r
+    if install:
+        net = {k: None for k in ("GOPROXY", "GOFLAGS", "CARGO_NET_OFFLINE", "npm_config_offline", "PIP_NO_INDEX")}  # unset: network on
+        cmds = []
+        if runner == "npm":
+            if (cwd / "pnpm-lock.yaml").exists() and shutil.which("pnpm"):
+                cmds = [["pnpm", "install", "--frozen-lockfile"]]
+            elif (cwd / "yarn.lock").exists() and shutil.which("yarn"):
+                cmds = [["yarn", "install", "--frozen-lockfile"]]
+            elif (cwd / "package-lock.json").exists():
+                cmds = [["npm", "ci", "--no-audit", "--no-fund"]]
+            else:
+                cmds = [["npm", "install", "--no-audit", "--no-fund"]]
+        elif runner == "python":
+            venv = os.path.join(scratch, f"venv-{h(rel, 8)}")
+            code, _ = run([sys.executable, "-m", "venv", venv], net)
+            target = []
+            if code == 0:
+                py = os.path.join(venv, "Scripts" if os.name == "nt" else "bin", "python")
+            else:  # some interpreters cannot build a venv with pip; install into a scratch folder instead
+                tdir = os.path.join(scratch, f"site-{h(rel, 8)}")
+                target = ["--target", tdir]
+                env["PYTHONPATH"] = tdir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            pip = ["{py}", "-m", "pip", "install", "-q", "--disable-pip-version-check", *target]
+            for req in ("requirements.txt", "requirements-dev.txt", "requirements_dev.txt", "requirements-test.txt",
+                        "requirements/dev.txt", "requirements/tests.txt", "requirements/test.txt"):
+                if (cwd / req).exists():
+                    cmds.append([*pip, "-r", req])
+            if (cwd / "pyproject.toml").exists() or (cwd / "setup.py").exists():
+                cmds.append([[*pip, "."]] if target else [[*pip, "-e", "."], [*pip, "."]])  # alternatives, first that works
+            if "pytest" in test_tools or "unittest" not in test_tools:
+                cmds.append([*pip, "pytest"])
+        elif runner == "go":
+            cmds = [["go", "mod", "download"]]
+        elif runner == "cargo":
+            cmds = [["cargo", "fetch"]]
+        elif runner == "dotnet":
+            cmds = [["dotnet", "restore"]]
+        elif runner == "maven":
+            cmds = [["mvn", "-q", "dependency:go-offline"]]
+        elif runner == "gradle":
+            cmds = [[build_cmd[0], "dependencies", "-q"]]
+        r["install_attempted"] = True
+        ok, text = True, ""
+        for c in cmds:
+            for alt in (c if isinstance(c[0], list) else [c]):
+                code, text = run(alt, net)
+                if code == 0:
+                    break
+            if code != 0:
+                ok = False
+                break
+        r["install_ok"] = ok
+        if not ok:
+            r.update(status="timed_out" if r["timed_out"] else "environment_missing",
+                     failure_class="timeout" if r["timed_out"] else "environment", seconds=round(time.time() - t0, 1))
+            return r
+    if runner == "npm":
+        r["dependencies_present"] = (cwd / "node_modules").is_dir() or (repo / "node_modules").is_dir()
+        if not r["dependencies_present"]:
+            r.update(status="environment_missing", failure_class="environment")
+            return r
+    code, text = run(build_cmd)
+    if code is None and not r["timed_out"]:
+        r.update(status="environment_missing", failure_class="environment", seconds=round(time.time() - t0, 1))
+        return r
+    r["build_ok"] = None if code is None else code == 0
+    if not r["build_ok"]:
+        fc = classify_failure(text, r["timed_out"])
+        r.update(failure_class=fc, status={"environment": "environment_missing", "timeout": "timed_out"}.get(fc, "build_failed"))
+        if fc in ("environment", "timeout"):
+            r["build_ok"] = None
+        r["seconds"] = round(time.time() - t0, 1)
+        return r
+    if list_cmd:
+        code, text = run(list_cmd)
+        if code is not None and not ENV_FAILURE_RX.search(text):
+            r["tests_collected"] = parse_listed(text, runner)
+            if r["dependencies_present"] is None:
+                r["dependencies_present"] = True
+        elif ENV_FAILURE_RX.search(text or ""):
+            r["dependencies_present"] = False
+    elif r["dependencies_present"] is None:
+        r["dependencies_present"] = True
+    r["status"] = "built"
+    if level == "full":
+        code, text = run(test_cmd)
+        passed, failed = parse_results(text, runner)
+        if passed is None and (code is None or code != 0):
+            fc = classify_failure(text, r["timed_out"])
+            if NO_TEST_SCRIPT_RX.search(text):
+                r.update(tests_ran=False, status="built_no_test_command")
+            elif fc in ("environment", "timeout"):
+                r.update(tests_ran=False, failure_class=fc, status="environment_missing" if fc == "environment" else "timed_out")
+            else:
+                r.update(tests_ran=True, failure_class=fc, status="tests_failed")
+        else:
+            r.update(tests_ran=True, tests_passed=passed, tests_failed=failed,
+                     status="tests_passed" if code == 0 else "tests_failed")
+            if code != 0:
+                r["failure_class"] = classify_failure(text, r["timed_out"]) if not failed else "repo"
+                if r["failure_class"] == "environment" and not failed:
+                    r["status"] = "environment_missing"
+    r["seconds"] = round(time.time() - t0, 1)
+    return r
+
+
+def stage_build(repo: Path, level: str, timeout: int, tests: dict, install: bool = False, max_roots: int = 3,
+                test_tools: list | None = None) -> dict:
+    names = [p for p, _ in list_files(repo)]
     base = {Path(p).name for p in names}
     systems = sorted({tool for f, tool in MANIFESTS.items() if f in base})
     if any(p.endswith((".sln", ".csproj")) for p in names):
@@ -763,59 +1254,89 @@ def stage_build(repo: Path, level: str, timeout: int, signals: dict, tests: dict
             pass
     elif "godot" in systems:
         engine = "godot"
+    roots = project_roots(names)
     out = {
-        "level": level, "build_systems": systems, "engine": engine, "engine_version": engine_version,
+        "level": level, "install": bool(install), "network_used": False,
+        "build_systems": systems, "engine": engine, "engine_version": engine_version,
         "host_os": {"Darwin": "darwin", "Linux": "linux", "Windows": "windows"}.get(platform.system(), "other"),
-        "tests_declared": tests.get("tests_declared"),
-        "dependencies_present": None, "build_ok": None, "tests_ran": None, "tests_passed": None, "tests_failed": None,
-        "test_pass_rate": None, "runnability": None, "reason": None, "timed_out": False, "seconds": 0,
+        "tests_found": tests.get("tests_declared"), "tests_declared": tests.get("tests_declared"),
+        "roots_found": len(roots), "roots_probed": 0, "roots_skipped": 0, "roots": [],
+        "status": "not_run", "failure_class": None, "repo_intrinsic_failure": None,
+        "dependencies_present": None, "build_ok": None, "tests_collected": None, "tests_ran": None, "tests_passed": None,
+        "tests_failed": None, "test_pass_rate": None, "discover_index": None, "runnability": None, "reason": None,
+        "timed_out": False, "seconds": 0,
     }
     if level == "detect":
         out["reason"] = "detect level runs nothing"
         return out
-    runner = next((s for s in ("npm", "python", "go", "cargo", "dotnet", "maven", "gradle") if s in systems), None)
-    if runner is None or engine in ("unity", "unreal"):
-        out["reason"] = "engine projects need the engine editor" if engine else "no supported build system"
+    if engine in ("unity", "unreal") and not any(r[1] != "dotnet" for r in roots):
+        out.update(status="environment_missing", failure_class="environment",
+                   reason="engine projects need the engine editor; the repo is not blamed")
         return out
-    build_cmd, test_cmd = BUILD_CMDS[runner]
-    if shutil.which(build_cmd[0]) is None and not build_cmd[0].startswith("./"):
-        out["reason"] = "toolchain not installed on this machine"
+    if not roots:
+        out.update(status="unsupported", reason="no supported build system")
         return out
-    deps_present = {"npm": (repo / "node_modules").is_dir(), "python": True, "go": True, "cargo": True}.get(runner, True)
-    out["dependencies_present"] = deps_present
-    if not deps_present:
-        out["reason"] = "dependencies are not installed; install them in the clone, then re-run (this script never downloads)"
-        return out
-    env = {**os.environ, **OFFLINE_ENV}
+    scratch = None
+    if install:
+        import tempfile
+        scratch = tempfile.mkdtemp(prefix="measure-code-build-")
+        out["network_used"] = True
     t0 = time.time()
-
-    def run(cmd):
-        try:
-            p = subprocess.run(cmd, cwd=repo, capture_output=True, timeout=timeout, check=False, env=env)
-            return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")[-200_000:]
-        except subprocess.TimeoutExpired:
-            out["timed_out"] = True
-            return None, ""
-        except OSError:
-            return None, ""
-
-    code, _ = run(build_cmd)
-    out["build_ok"] = None if code is None else code == 0
-    if level == "full" and out["build_ok"]:
-        code, text = run(test_cmd)
-        out["tests_ran"] = code is not None
-        passed, failed = parse_results(text, runner)
-        out["tests_passed"], out["tests_failed"] = passed, failed
-        if passed is not None and (passed + (failed or 0)):
-            out["test_pass_rate"] = round(passed / (passed + (failed or 0)), 3)
+    results = []
+    try:
+        for rel, runner, _ in roots[:max_roots]:
+            if time.time() - t0 > 3 * timeout:
+                break
+            results.append(probe_root(repo, rel, runner, level, timeout, install, scratch, test_tools or []))
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+    out["roots"] = results
+    out["roots_probed"] = len(results)
+    out["roots_skipped"] = len(roots) - len(results)
     out["seconds"] = round(time.time() - t0, 1)
-    if out["build_ok"] is None:
-        out["reason"] = "build timed out" if out["timed_out"] else "build could not start"
-    else:  # 0-4: builds, declares tests, ran a suite, 90%+ of tests pass
-        out["runnability"] = (int(bool(out["build_ok"])) + int(bool(tests.get("tests_declared")))
-                              + int(bool(out["tests_ran"])) + int((out["test_pass_rate"] or 0) >= 0.9))
-        if level == "discover":
-            out["reason"] = "discover level builds only; runnability counts at most 2"
+    out["timed_out"] = any(r["timed_out"] for r in results)
+    definite = [r for r in results if r["build_ok"] is not None]
+    deps = [r["dependencies_present"] for r in results if r["dependencies_present"] is not None]
+    out["dependencies_present"] = all(deps) if deps else None
+    out["build_ok"] = all(r["build_ok"] for r in definite) if definite else None
+    listed = [r["tests_collected"] for r in results if r["tests_collected"] is not None]
+    out["tests_collected"] = sum(listed) if listed else None
+    ran = [r for r in results if r["tests_ran"]]
+    out["tests_ran"] = bool(ran) if level == "full" and definite else None
+    if ran:
+        ps = [r["tests_passed"] for r in ran if r["tests_passed"] is not None]
+        fs = [r["tests_failed"] for r in ran if r["tests_failed"] is not None]
+        out["tests_passed"] = sum(ps) if ps else None
+        out["tests_failed"] = sum(fs) if fs else None
+        if out["tests_passed"] is not None and out["tests_passed"] + (out["tests_failed"] or 0):
+            out["test_pass_rate"] = round(out["tests_passed"] / (out["tests_passed"] + (out["tests_failed"] or 0)), 3)
+    classes = [r["failure_class"] for r in results if r["failure_class"]]
+    out["failure_class"] = ("repo" if "repo" in classes else "environment" if "environment" in classes else
+                            "timeout" if "timeout" in classes else "unknown" if classes else "none")
+    out["repo_intrinsic_failure"] = "repo" in classes
+    if not definite:
+        st = {r["status"] for r in results}
+        out["status"] = "timed_out" if st == {"timed_out"} else "environment_missing"
+        out["reason"] = ("the build timed out" if out["status"] == "timed_out" else
+                         "the toolchain, dependencies or network this repo needs are missing here; the repo is not blamed. "
+                         "Install dependencies in the clone or pass --install (uses the network), then re-run")
+        return out
+    out["status"] = ("build_failed" if not out["build_ok"] else "built" if level == "discover" else
+                     "tests_failed" if any(r["status"] == "tests_failed" for r in results) else
+                     "environment_missing" if not ran and any(r["status"] == "environment_missing" for r in results) else
+                     "built_no_tests_run" if not ran else "tests_passed")
+    # discover index 0-3: dependencies present, build ok, runner lists 1+ tests
+    out["discover_index"] = (int(bool(out["dependencies_present"])) + int(bool(out["build_ok"]))
+                             + int(bool(out["tests_collected"])))
+    if level == "full" and out["status"] != "environment_missing":
+        # executed runnability 0-4: build ok, a suite ran, any test passed, 90%+ passed. Executed terms only.
+        out["runnability"] = (int(bool(out["build_ok"])) + int(bool(ran)) + int(bool(out["tests_passed"]))
+                              + int((out["test_pass_rate"] or 0) >= 0.9))
+    elif level == "full":
+        out["reason"] = "the build ran but the test suite could not start here (missing tool or package); the repo is not blamed"
+    else:
+        out["reason"] = "discover level builds and lists tests only; runnability needs --build full"
     return out
 
 
@@ -825,38 +1346,67 @@ def stage_build(repo: Path, level: str, timeout: int, signals: dict, tests: dict
 
 
 def stage_blame(repo: Path, cutoff: str, budget: int) -> dict:
+    """Blame date of every line of first-party, non-test source at HEAD. Largest files go first. The share is
+    reported only when every file was blamed; otherwise the result is marked partial with its line coverage."""
     cutoff_ts = dt.datetime.strptime(cutoff, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc).timestamp()
     files = []
     for rel, _ in list_files(repo):
         lang = LANG_BY_EXT.get(Path(rel).suffix.lower())
         if lang and not vendor_kind(rel) and not is_test_path(rel):
             try:
-                files.append(((repo / rel).stat().st_size, rel))
+                with (repo / rel).open("rb") as f:
+                    n = f.read().count(b"\n")
+                files.append((n, rel))
             except OSError:
                 pass
     files.sort(reverse=True)  # biggest first, so a cut-off budget still covers most lines
+    lines_total = sum(n for n, _ in files)
     t0 = time.time()
-    blamed = after = done = 0
+    blamed = after = done = failed = 0
+    budget_hit = False
     for _, rel in files:
         if time.time() - t0 > budget:
+            budget_hit = True
             break
         try:
             raw = git(repo, "blame", "--line-porcelain", "-w", "HEAD", "--", rel, timeout=max(5, int(budget - (time.time() - t0))))
         except (RuntimeError, subprocess.TimeoutExpired):
+            failed += 1
             continue
         times = [int(x) for x in re.findall(r"^author-time (\d+)$", raw, re.M)]
         blamed += len(times)
         after += sum(1 for t in times if t >= cutoff_ts)
         done += 1
-    return {"files_blamed": done, "files_total": len(files), "lines_blamed": blamed,
+    complete = done == len(files)
+    coverage = round(min(1.0, blamed / lines_total), 3) if lines_total else None
+    return {"status": "complete" if complete else "partial",
+            "partial_reason": None if complete else ("budget_exhausted" if budget_hit else "blame_failed_on_some_files"),
+            "files_blamed": done, "files_failed": failed, "files_total": len(files), "lines_total": lines_total,
+            "lines_blamed": blamed, "coverage_share": coverage,
             "lines_written_since_cutoff": after,
-            "share_written_since_cutoff": round(after / blamed, 3) if blamed else None,
-            "complete": done == len(files), "budget_seconds": budget}
+            "share_written_since_cutoff": round(after / blamed, 3) if blamed and complete else None,
+            "share_in_blamed_lines": round(after / blamed, 3) if blamed else None,
+            "complete": complete, "budget_seconds": budget, "cutoff": cutoff}
 
 
 # --------------------------------------------------------------------------
 # derived: classification, logic band, tasks, recommendation
 # --------------------------------------------------------------------------
+
+
+SCAFFOLDS = {  # file sets an untouched project generator leaves behind
+    "create-react-app": ("src/logo.svg", "src/reportWebVitals.js"),
+    "create-react-app-ts": ("src/logo.svg", "src/react-app-env.d.ts"),
+    "vite-react": ("src/assets/react.svg", "public/vite.svg"),
+    "vite-vue": ("src/assets/vue.svg", "public/vite.svg"),
+    "create-next-app": ("public/next.svg", "public/vercel.svg"),
+    "angular-cli": ("src/app/app.component.spec.ts", "src/favicon.ico"),
+}
+
+
+def scaffold_hits(names) -> list:
+    ns = set(names)
+    return sorted(k for k, files in SCAFFOLDS.items() if all(f in ns for f in files))
 
 
 def classify(langs: dict, signals: dict, build: dict, git_: dict) -> dict:
@@ -881,63 +1431,96 @@ def classify(langs: dict, signals: dict, build: dict, git_: dict) -> dict:
     primary = best[0][0] if best and best[0][1] >= 1 else "library_or_tool"
     tot = sum(v for v in score.values() if v > 0) or 1
     ws = signals.get("workspaces", {})
-    demo_reasons = []
-    if git_.get("commits", 0) < 15:
-        demo_reasons.append("fewer than 15 commits")
-    if git_.get("history_single_commit"):
-        demo_reasons.append("single-commit snapshot")
+    # Strong signals decide; weak ones are recorded but only decide together. Truncated history is never evidence.
+    strong, weak = [], []
     if signals.get("demo_words"):
-        demo_reasons.append("readme describes a tutorial, template or starter")
+        strong.append("readme describes a tutorial, template or starter")
+    if signals.get("scaffolds"):
+        strong.append("project generator files left as generated")
+    commits = git_.get("commits") or 0
+    history_ok = git_.get("history_complete") is not False or git_.get("history_single_commit")
+    if history_ok and not git_.get("history_shallow") and git_.get("commits") is not None:
+        if commits < 15:
+            weak.append("fewer than 15 commits")
+        if git_.get("history_single_commit"):
+            weak.append("single-commit snapshot")
     if total < 1500:
-        demo_reasons.append("under 1,500 lines of code")
+        weak.append("under 1,500 lines of code")
+    demo = (bool(strong) and (total < 5000 or commits < 30)) or len(weak) >= 3
     return {"primary_class": primary,
             "class_scores": {k: round(v / tot, 2) for k, v in score.most_common() if v > 0},
             "is_monorepo": bool(ws.get("monorepo_tooling")) or ws.get("package_roots", 0) >= 4,
-            "is_likely_demo": len(demo_reasons) >= 2, "demo_reasons": demo_reasons}
+            "is_likely_demo": demo, "demo_reasons": strong + weak,
+            "demo_strong_signals": len(strong), "demo_weak_signals": len(weak)}
 
 
 def logic_band(logic: dict, tests: dict) -> tuple:
+    """Deterministic 0-6 band from densities, not size steps, so large repos do not all saturate.
+    size (log scale, max 1) + branching density (max 1.5) + share of deeply nested files (max 1.5)
+    + test/source line ratio (max 1) + modularity (max 1)."""
+    import math
     loc = logic.get("source_code_lines") or 0
-    reasons, band = [], 0
-    for cond, why in ((loc >= 2_000, "2k+ source lines"), (loc >= 20_000, "20k+ source lines"),
-                      ((logic.get("branches_per_kloc") or 0) >= 80, "dense branching"),
-                      (logic.get("files_nesting_5plus", 0) >= 3, "several deeply nested files"),
-                      (logic.get("top_level_modules", 0) >= 5, "5+ top-level modules"),
-                      ((tests.get("test_to_source_line_ratio") or 0) >= 0.1, "tests cover 10%+ of source lines")):
-        if cond:
-            band += 1
-            reasons.append(why)
-    return min(band, 6), reasons
+    bpk = logic.get("branches_per_kloc") or 0
+    nest = logic.get("files_nesting_5plus_share") or 0
+    tr = tests.get("test_to_source_line_ratio") or 0
+    mods = logic.get("top_level_modules") or 0
+    parts = {
+        "size": min(1.0, max(0.0, math.log10(loc / 1000) / 2)) if loc > 1000 else 0.0,   # 1k lines -> 0, 100k -> 1
+        "branching density": 1.5 * min(1.0, max(0.0, (bpk - 60) / 180)),                  # 60/kloc -> 0, 240 -> 1.5
+        "deep nesting": 1.5 * min(1.0, nest / 0.4),                                       # 40% of files nested 5+ -> 1.5
+        "tests": min(1.0, tr / 0.4),                                                      # test lines 40% of source -> 1
+        "modularity": min(1.0, max(0, mods - 1) / 9),                                     # 10+ top-level modules -> 1
+    }
+    total = sum(parts.values())
+    band = int(min(6, round(total)))
+    reasons = [f"{k} {v:.2f}" for k, v in parts.items()]
+    return band, reasons, round(total, 2)
 
 
-def task_block(sig: dict | None) -> dict:
+def task_block(sig: dict | None, reason: str = "not run in simple mode") -> dict:
     if sig is None:
-        return {"method": "not run in simple mode", "candidates": None, "candidates_total": None,
-                "source_only_candidates": None, "commit_kinds": None}
+        return {"method": reason, "candidates": None, "candidates_total": None,
+                "source_only_candidates": None, "commit_kinds": None, "capacity": None}
     g = lambda k: sig.get(k, 0)  # noqa: E731
     return {
-        "method": "deterministic commit census (message keywords + files touched); counts only",
+        "method": "deterministic commit census (strict message kinds, lines changed, files and folders touched); counts only",
         "candidates": {k: g(f"{k}_with_tests") for k in TASK_KINDS},
         "candidates_total": g("with_tests_total"),
         "source_only_candidates": {k: g(f"{k}_source_only") for k in TASK_KINDS},
         "commit_kinds": {k: g(f"{k}_commits") for k in TASK_KINDS},
+        "capacity": {
+            "mineable_commits": g("mineable_commits"),
+            "mineable_by_kind": {k: g(f"{k}_mineable") for k in TASK_KINDS},
+            "rule": dict(CAPACITY_RULE),
+            "chore_commits_excluded": g("chore_commits"), "too_spread_commits_excluded": g("too_spread_commits"),
+            "bulk_test_commits": g("bulk_test_commits"),
+            "fix_subjects_not_corroborated": g("fix_subject_not_corroborated"),
+            "bugfix_with_regression_test": g("bugfix_with_regression_test"),
+            "lines_changed_first_party": g("lines_changed_first_party"),
+        },
     }
+
+
+STATUS_REASONS = ("simple_mode", "not_a_git_repository", "no_commits", "shallow_clone", "census_not_run",
+                  "task_mining_skipped", "build_not_executed", "build_environment_missing", "build_timed_out",
+                  "code_age_partial", "code_age_not_run")
 
 
 def recommend(doc: dict) -> dict:
     g, t = doc["git"], doc["tree"]
     reasons, score = [], 0
-    for cond, why in ((g["commits"] >= 200, "200+ commits of history"),
+    commits = g.get("commits") or 0
+    for cond, why in ((commits >= 200, "200+ commits of history"),
                       ((t["code_lines_total"] or 0) >= 10_000, "10k+ lines of code"),
-                      ((g["pre_cutoff_share"] or 0) >= 0.3, "30%+ of history predates the cutoff"),
-                      (g["authors_human"] >= 2, "more than one human author"),
+                      ((g.get("pre_cutoff_share") or 0) >= 0.3, "30%+ of history predates the cutoff"),
+                      ((g.get("authors_human") or 0) >= 2, "more than one human author"),
                       ((doc["tests"]["test_files"] or 0) > 0, "has tests"),
                       (not doc["classification"]["is_likely_demo"], "not a demo or template")):
         if cond:
             score += 1
             reasons.append(why)
     verdict = "recommended" if score >= 5 else "optional" if score >= 3 else "not worth it"
-    minutes = 1 + (t["code_lines_total"] or 0) / 150_000 + g["commits"] / 40_000 + 5
+    minutes = 1 + (t["code_lines_total"] or 0) / 150_000 + commits / 40_000 + 5
     return {"full_run": verdict, "reasons": reasons, "estimated_full_run_minutes": int(round(minutes))}
 
 
@@ -946,14 +1529,19 @@ def recommend(doc: dict) -> dict:
 # --------------------------------------------------------------------------
 
 STRING_FIELDS = [re.compile(p) for p in (
-    r"^schema$", r"^kind$", r"^tool$", r"^tool_version$", r"^mode$", r"^status$", r"^measured_at$", r"^label$",
-    r"^tags\[\d+\]$", r"^cutoff$", r"^span\.(first|last)$", r"^git\.(first|last)_commit$",
-    r"^fingerprints\.\w+\[\d+\]$", r"^tree\.mode_note$", r"^lanes\.\w+$", r"^tests\.frameworks\[\d+\]$",
-    r"^build\.(level|build_systems\[\d+\]|engine|engine_version|host_os|reason)$",
-    r"^signals\.(frameworks|ci\.systems|hygiene\.\w+|dependencies\.(package_managers|lockfiles)|observability\.\w+|workspaces\.monorepo_tooling)\[\d+\]$",
-    r"^classification\.(primary_class|demo_reasons\[\d+\])$", r"^logic\.reasons\[\d+\]$", r"^tasks\.method$",
-    r"^census\.(themes\[\d+\]|ideas\[\d+\]\.(kind|text)|categories\.\w+\[\d+\]|summary|reviewer)$",
-    r"^recommendation\.(full_run|reasons\[\d+\])$", r"^privacy\.\w+$",
+    r"^schema$", r"^kind$", r"^tool$", r"^tool_version$", r"^mode$", r"^status$", r"^status_reasons\[\d+\]$", r"^skip_reason$",
+    r"^measured_at$", r"^label$", r"^tags\[\d+\]$", r"^cutoff$", r"^span\.(first|last)$", r"^git\.(first|last)_commit$",
+    r"^git\.history_note$", r"^history_ref\.(policy|measured)$",
+    r"^fingerprints\.\w+\[\d+\]$", r"^tree\.(mode_note|code_lines_definition)$", r"^lanes\.\w+$", r"^tests\.frameworks\[\d+\]$",
+    r"^build\.(level|build_systems\[\d+\]|engine|engine_version|host_os|reason|status|failure_class)$",
+    r"^build\.roots\[\d+\]\.(runner|status|failure_class)$",
+    r"^code_age\.(status|partial_reason|cutoff)$",
+    r"^signals\.(frameworks|scaffolds|ci\.systems|hygiene\.\w+|dependencies\.(package_managers|lockfiles)|observability\.\w+|workspaces\.monorepo_tooling)\[\d+\]$",
+    r"^classification\.(primary_class|demo_reasons\[\d+\])$", r"^logic\.(reasons\[\d+\]|authoritative)$", r"^tasks\.method$",
+    r"^task_mining\.(status|skip_reason|kinds_note)$",
+    r"^census\.(themes\[\d+\]|ideas\[\d+\]\.(kind|text)|categories\.\w+\[\d+\]|summary|reviewer|model|weights_version|"
+    r"task_mining\.(status|skip_reason)|what_could_not_be_assessed\[\d+\])$",
+    r"^recommendation\.(full_run|reasons\[\d+\])$", r"^privacy\.\w+$", r"^provenance\.\w+$",
 )]
 EMAIL_RX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 ABS_PATH_RX = re.compile(r"(^|[\s\"'(])(/(Users|home|Volumes|mnt|var|tmp|opt|private)/|[A-Za-z]:\\)")
@@ -1032,54 +1620,95 @@ def fmt(n) -> str:
     return f"{n:,}"
 
 
+def of(x, top) -> str:
+    return "n/a" if x is None else f"{x}/{top}"
+
+
 def ratio(x) -> str:
     return "n/a" if x is None else f"{x:.2f}"
 
 
 def summary_row(doc: dict) -> dict:
     g, t, ts, b, lg, tk, c = doc["git"], doc["tree"], doc["tests"], doc["build"], doc["logic"], doc["tasks"], doc["classification"]
-    s = doc.get("signals", {})
+    s = doc.get("signals") or {}
+    ca = doc.get("code_age") or {}
+    tm = doc.get("task_mining") or {}
+    cap = tk.get("capacity") or {}
     row = {
-        "label": doc["label"], "mode": doc["mode"], "status": doc["status"], "measured_at": doc["measured_at"],
+        "label": doc["label"], "mode": doc["mode"], "status": doc["status"], "estimate": doc["estimate"],
+        "status_reasons": ";".join(doc["status_reasons"]) or None, "skip_reason": doc["skip_reason"],
+        "measured_at": doc["measured_at"],
         "primary_language": next(iter(t["languages"]), None), "languages": len(t["languages"]),
-        "code_lines": t["code_lines_total"], "source_files": t["source_files"], "test_files": ts["test_files"],
-        "test_code_lines": ts["test_code_lines"], "test_ratio": ts["test_to_source_line_ratio"], "tests_declared": ts.get("tests_declared"),
+        "code_lines": t["code_lines_total"], "nonblank_lines": t.get("nonblank_lines_total"), "source_files": t["source_files"],
+        "test_files": ts["test_files"], "test_code_lines": ts["test_code_lines"], "test_ratio": ts["test_to_source_line_ratio"],
+        "tests_declared": ts.get("tests_declared"), "test_frameworks": ";".join(ts.get("frameworks") or []) or None,
         "frameworks": ";".join(s.get("frameworks", [])) or None, "ci_present": bool(s.get("ci", {}).get("systems")) if s else None,
         "ci_runs_tests": s.get("ci", {}).get("runs_tests") if s else None,
         "commits": g["commits"], "authors_human": g["authors_human"], "first_commit": g["first_commit"],
         "last_commit": g["last_commit"], "span_days": g["span_days"], "active_days": g["active_days"],
-        "active_months": g["active_months"], "pre_cutoff_share": g["pre_cutoff_share"],
-        "code_written_since_cutoff_share": (doc.get("code_age") or {}).get("share_written_since_cutoff"),
+        "active_months": g["active_months"], "history_shallow": g.get("history_shallow"), "history_complete": g.get("history_complete"),
+        "history_ref": (doc.get("history_ref") or {}).get("measured"),
+        "pre_cutoff_share": g["pre_cutoff_share"],
+        "code_written_since_cutoff_share": ca.get("share_written_since_cutoff"),
+        "code_age_status": ca.get("status"), "code_age_coverage": ca.get("coverage_share"),
         "pr_merged_count": g.get("pr_merged_count"), "ai_assisted_share": g.get("ai_assisted_share"),
         "primary_class": c["primary_class"], "is_monorepo": c["is_monorepo"], "is_likely_demo": c["is_likely_demo"],
-        "build_ok": b.get("build_ok"), "runnability": b.get("runnability"), "logic_depth": lg["logic_depth"],
-        "reviewer_logic_depth": (doc.get("census") or {}).get("logic_depth"),
-        "task_candidates": tk["candidates_total"],
+        "build_status": b.get("status"), "build_failure_class": b.get("failure_class"), "build_ok": b.get("build_ok"),
+        "tests_found": b.get("tests_found"), "tests_collected": b.get("tests_collected"), "tests_ran": b.get("tests_ran"),
+        "discover_index": b.get("discover_index"), "runnability": b.get("runnability"),
+        "logic_depth": lg["logic_depth"], "logic_depth_authoritative": lg["authoritative"],
+        "deterministic_logic_depth": lg["deterministic_depth"], "reviewer_logic_depth": lg["reviewer_depth"],
+        "capacity": cap.get("mineable_commits"), "task_candidates": tk["candidates_total"],
+        "task_mining_status": tm.get("status"), "mined_ideas": tm.get("ideas_total"),
     }
+    for k in IDEA_KINDS:
+        row[f"mined_{k}"] = (tm.get("ideas_by_kind") or {}).get(k) if tm.get("ideas_by_kind") else None
     for k in TASK_KINDS:
         row[f"tasks_{k}"] = (tk["candidates"] or {}).get(k) if tk["candidates"] else None
     return row
+
+
+AUTH_LABEL = {"deterministic": "deterministic band", "reviewer_census": "reviewer census"}
 
 
 def render_report(doc: dict) -> str:
     g, t, tests, b, lg, tk, cl = doc["git"], doc["tree"], doc["tests"], doc["build"], doc["logic"], doc["tasks"], doc["classification"]
     simple = doc["mode"] == "simple"
     rec = doc["recommendation"]
+    est = " (estimate)" if simple else ""
     L = [f"# Code measurement: {doc['label']}" + (" (simple mode)" if simple else ""), "",
-         f"Measured {doc['measured_at'][:10]} with {TOOL} {VERSION}, {doc['mode']} mode. Counts only: no names, paths or messages."]
+         f"Measured {doc['measured_at'][:10]} with {TOOL} {VERSION}, {doc['mode']} mode. Counts only: no names, paths or messages.",
+         "", f"**Status: {doc['status']}**" + (f" ({', '.join(doc['status_reasons'])})" if doc["status_reasons"] else
+                                              " (every lane ran, including the reviewer census and task mining)")]
+    if simple:
+        L += ["", "_Every figure in this report is an estimate from metadata and a file sample. Run full mode for measured numbers._"]
     if t.get("mode_note"):
         L += ["", f"_Estimate: {t['mode_note']}._"]
+    if g.get("history_note"):
+        L += ["", f"_History: {g['history_note']}._"]
+    ref = doc.get("history_ref") or {}
+    if ref.get("measured") == "deepest_branch":
+        L += ["", f"_History was measured on the deepest branch ({fmt(ref['measured_commits'])} commits) because HEAD holds only "
+                  f"{fmt(ref['head_commits'])}. Lines of code and tests describe the checked-out tree; check that branch out to measure its tree._"]
+    elif ref.get("deeper_ref_exists"):
+        L += ["", f"_A branch holds {fmt(ref['deepest_ref_commits'])} commits against {fmt(ref['head_commits'])} on HEAD; "
+                  "re-run with --ref auto to measure it._"]
     L += ["", "## 1. Headline", "",
           f"- {fmt(g['commits'])} commits by {fmt(g['authors_human'])} people (+{fmt(g['authors_bot'])} bots), "
-          f"{g['first_commit']} to {g['last_commit']} ({fmt(g['active_months'])} active months, {fmt(g['active_days'])} active days)",
-          f"- {fmt(t['code_lines_total'])} lines of code{' (estimate)' if simple else ''} in {fmt(t['source_files'])} source files; "
-          f"main language {next(iter(t['languages']), 'n/a')}; class {cl['primary_class']}",
-          f"- Tests: {fmt(tests['test_files'])} files, {fmt(tests.get('tests_declared'))} test cases declared, "
-          f"test/source line ratio {ratio(tests['test_to_source_line_ratio'])}",
+          f"{g['first_commit'] or 'n/a'} to {g['last_commit'] or 'n/a'} ({fmt(g['active_months'])} active months, {fmt(g['active_days'])} active days)",
+          f"- {fmt(t['code_lines_total'])} lines of code{', estimated' if simple else ''} (comments and blank lines excluded; {fmt(t.get('nonblank_lines_total'))} "
+          f"non-blank lines with comments) in {fmt(t['source_files'])} source files; main language {next(iter(t['languages']), 'n/a')}; "
+          f"class {cl['primary_class']}",
+          f"- Tests{est}: {fmt(tests['test_files'])} files, {fmt(tests.get('tests_declared'))} test cases declared, "
+          f"test/source line ratio {ratio(tests['test_to_source_line_ratio'])}; test tools {', '.join(tests.get('frameworks') or []) or 'none detected'}",
           f"- {fmt(g['pre_cutoff_share'])} of commits are dated before {doc['cutoff']}"
           + (f"; {fmt(doc['code_age']['share_written_since_cutoff'])} of today's code lines were written after it"
              if doc.get("code_age") and doc["code_age"].get("share_written_since_cutoff") is not None else ""),
-          f"- Logic depth band {lg['logic_depth']}/6" + ("" if simple else f"; {fmt(tk['candidates_total'])} commits change source and tests together"),
+          f"- Logic depth **{lg['logic_depth']}/6** (from the {AUTH_LABEL.get(lg['authoritative'], lg['authoritative'])}"
+          + (f"; deterministic band {lg['deterministic_depth']}/6" if lg["authoritative"] != "deterministic" else "") + ")",
+          *([] if simple else [f"- Capacity: {fmt((tk.get('capacity') or {}).get('mineable_commits'))} mineable commits; "
+                               f"{fmt(tk['candidates_total'])} commits change source and tests together; "
+                               f"{fmt((doc.get('task_mining') or {}).get('ideas_total'))} mined task ideas"]),
           *([f"- Full run: **{rec['full_run']}** ({'; '.join(rec['reasons']) or 'little to measure'}); about {rec['estimated_full_run_minutes']} minutes"]
             if simple else []), "",
           "## 2. History", "", "| metric | value |", "|---|---|"]
@@ -1087,10 +1716,12 @@ def render_report(doc: dict) -> str:
               "top1_author_share", "top5_author_share", "span_days", "recency_days", "active_days", "active_months",
               "commits_last_12_months", "pre_cutoff_commits", "pre_cutoff_share", "tags", "semver_tags", "branches",
               "pr_merged_count", "conventional_commit_share_last_200", "ai_coauthored_commits", "ai_agent_commits",
-              "history_shallow"):
+              "history_shallow", "history_complete"):
         L.append(f"| {k.replace('_', ' ')} | {fmt(g.get(k))} |")
-    L += ["", "| year | commits |", "|---|---|"] + [f"| {y} | {fmt(n)} |" for y, n in g["commits_by_year"].items()]
-    L += ["", "## 3. Lines by language", "", "| language | files | code | comments | blank |", "|---|---|---|---|---|"]
+    if ref:
+        L.append(f"| history measured on | {ref.get('measured', 'n/a').replace('_', ' ')} ({fmt(ref.get('refs_considered'))} branches compared) |")
+    L += ["", "| year | commits |", "|---|---|"] + [f"| {y} | {fmt(n)} |" for y, n in (g.get("commits_by_year") or {}).items()]
+    L += ["", "## 3. Lines by language" + est, "", "| language | files | code | comments | blank |", "|---|---|---|---|---|"]
     for name, v in t["languages"].items():
         L.append(f"| {name} | {fmt(v.get('files', 0))} | {fmt(v.get('code_lines', 0))} | {fmt(v.get('comment_lines', 0))} | {fmt(v.get('blank_lines', 0))} |")
     L += ["", f"Median source file {fmt(t['median_file_lines'])} lines, 90th percentile {fmt(t['p90_file_lines'])}. "
@@ -1128,83 +1759,245 @@ def render_report(doc: dict) -> str:
               f"assistant-phrase hits {fmt(a['llm_phrase_hits'])}; generated-marker files {fmt(a['generated_marker_files'])}; "
               f"mock calls {fmt(a.get('mock_calls'))} vs assertions {fmt(a.get('assertions'))} in tests."]
     L += ["", "## 6. Build probe", "",
-          f"- level: {b['level']}; build systems: {', '.join(b['build_systems']) or 'none'}; engine: {b['engine'] or 'none'} {b['engine_version'] or ''}".rstrip(),
-          f"- build ok: {fmt(b.get('build_ok'))}; tests passed {fmt(b.get('tests_passed'))}, failed {fmt(b.get('tests_failed'))}; "
-          f"runnability {fmt(b.get('runnability'))}/4" + (f"; note: {b['reason']}" if b.get("reason") else "")]
-    L += ["", "## 7. Logic depth", "", f"Deterministic band **{lg['logic_depth']}/6** ({'; '.join(lg['reasons']) or 'small or flat codebase'})."]
+          f"- level: {b['level']}{' with dependency install (network used)' if b.get('install') else ''}; status **{b.get('status')}**"
+          f"{'; failure attributed to: ' + b['failure_class'] if b.get('failure_class') not in (None, 'none') else ''}",
+          f"- build systems: {', '.join(b['build_systems']) or 'none'}; engine: {b['engine'] or 'none'} {b['engine_version'] or ''}".rstrip()
+          + f"; project roots probed {fmt(b.get('roots_probed'))} of {fmt(b.get('roots_found'))}",
+          f"- build ok: {fmt(b.get('build_ok'))}; tests found in files {fmt(b.get('tests_found'))}, listed by the runner "
+          f"{fmt(b.get('tests_collected'))}, suite ran {fmt(b.get('tests_ran'))}; passed {fmt(b.get('tests_passed'))}, failed {fmt(b.get('tests_failed'))}",
+          f"- discover index {of(b.get('discover_index'), 3)}; executed runnability {of(b.get('runnability'), 4)}"
+          + (f"; note: {b['reason']}" if b.get("reason") else "")]
+    ca = doc.get("code_age")
+    if ca:
+        L += ["", "## 7. Code age", "",
+              f"Blame {ca['status']}: {fmt(ca['files_blamed'])} of {fmt(ca['files_total'])} source files, "
+              f"{fmt(ca['coverage_share'])} of their lines. "
+              + (f"{fmt(ca['share_written_since_cutoff'])} of today's lines were written after {ca['cutoff']}."
+                 if ca.get("share_written_since_cutoff") is not None else
+                 f"No whole-repo share is reported ({(ca.get('partial_reason') or '').replace('_', ' ')}); in the blamed lines "
+                 f"{fmt(ca.get('share_in_blamed_lines'))} were written after {ca['cutoff']}.")]
+    L += ["", "## 8. Logic depth", "",
+          f"Authoritative value **{lg['logic_depth']}/6** from the {AUTH_LABEL.get(lg['authoritative'], lg['authoritative'])}.",
+          f"Deterministic band {lg['deterministic_depth']}/6 (score {lg['deterministic_score']}: {'; '.join(lg['reasons'])})."]
     if not simple:
         L += [f"Functions (estimate) {fmt(lg['functions_estimate'])}; branch points per 1,000 lines {fmt(lg['branches_per_kloc'])}; "
               f"nesting depth (95th percentile) {fmt(lg['max_nesting_levels'])}; files nested 5+ deep {fmt(lg['files_nesting_5plus'])}."]
     c = doc.get("census")
     if c:
-        L += ["", f"Reviewer census: logic depth **{c['logic_depth']}/6**, self-contained {c['self_contained']}/4.", "",
-              "| category | count |", "|---|---|"] + [f"| {k.replace('_', ' ')} | {fmt(len(v))} |" for k, v in c["categories"].items()]
+        L += ["", f"Reviewer census: weighted total {fmt(c.get('weighted_total'))} gives logic depth **{c['logic_depth']}/6**"
+              + (f" (the reviewer's own judgement was {c['reviewer_judgement']}/6)" if c.get("reviewer_judgement") is not None else "")
+              + f"; self-contained {c['self_contained']}/4" + (f"; model {c['model']}" if c.get("model") else "") + ".", "",
+              "| category | count | weight |", "|---|---|---|"] + [
+                  f"| {k.replace('_', ' ')} | {fmt(len(v))} | {CENSUS_WEIGHTS.get(k, '')} |" for k, v in c["categories"].items()]
+        if c.get("defect_repairs_with_test") is not None:
+            L.append(f"| defect repairs shipped with a test (bonus) | {fmt(c['defect_repairs_with_test'])} | {CENSUS_WEIGHTS['defect_repairs_with_test']} |")
         if c.get("themes"):
             L += ["", "Themes: " + "; ".join(c["themes"])]
     if not simple:
-        L += ["", "## 8. Task candidates", "", "Commits that change source and tests together (1-20 files), by kind.", "",
-              "| kind | with tests | source only | all commits |", "|---|---|---|---|"]
+        cap = tk.get("capacity") or {}
+        L += ["", "## 9. Capacity and task candidates", ""]
+        if cap:
+            r_ = cap["rule"]
+            L += [f"Mineable commits (capacity): **{fmt(cap['mineable_commits'])}**: non-merge, non-bot, not a chore, "
+                  f"{r_['min_impl_files']}+ first-party non-test source files, {r_['min_churn']:,}-{r_['max_churn']:,} lines changed, "
+                  f"at most {r_['max_files']} files in {r_['max_dirs']} folders. Excluded: {fmt(cap['chore_commits_excluded'])} chores, "
+                  f"{fmt(cap['too_spread_commits_excluded'])} too spread out. Fix subjects without deleted lines (not counted as fixes): "
+                  f"{fmt(cap['fix_subjects_not_corroborated'])}. Fixes shipped with a test: {fmt(cap['bugfix_with_regression_test'])}. "
+                  f"Bulk test-add commits: {fmt(cap['bulk_test_commits'])}.", ""]
+        L += ["| kind | mineable | with tests | source only | all commits |", "|---|---|---|---|---|"]
         for k in TASK_KINDS:
-            L.append(f"| {k} | {fmt(tk['candidates'][k])} | {fmt(tk['source_only_candidates'][k])} | {fmt(tk['commit_kinds'][k])} |")
+            L.append(f"| {k} | {fmt((cap.get('mineable_by_kind') or {}).get(k))} | {fmt((tk['candidates'] or {}).get(k))} | "
+                     f"{fmt((tk['source_only_candidates'] or {}).get(k))} | {fmt((tk['commit_kinds'] or {}).get(k))} |")
+        tm = doc.get("task_mining") or {}
+        L += ["", "## 10. Task mining", "", f"Status: **{tm.get('status')}**" + (f" ({tm['skip_reason'].replace('_', ' ')})" if tm.get("skip_reason") else "")]
+        if tm.get("ideas_by_kind"):
+            L += ["", "| kind | ideas |", "|---|---|"] + [f"| {k.replace('_', ' ')} | {fmt(v)} |" for k, v in tm["ideas_by_kind"].items()]
+            L += [f"| total (cap {tm.get('cap')}) | {fmt(tm.get('ideas_total'))} |"]
         if c and c.get("ideas"):
-            L += ["", "Generic task ideas:", ""] + [f"- {i['kind']}: {i['text']}" for i in c["ideas"]]
+            L += ["", "Generic task ideas:", ""] + [f"- {i['kind'].replace('_', ' ')}: {i['text']}" for i in c["ideas"]]
     L += ["", "## Lanes", ""] + [f"- {k}: {v}" for k, v in doc["lanes"].items()]
+    pv = doc.get("provenance") or {}
+    if pv:
+        L += ["", "## Provenance", "", f"- head commit fingerprint `{pv.get('head_commit_fingerprint')}`; scripts digest `{pv.get('scripts_digest')}`; "
+              f"payload digest `{pv.get('payload_digest')}`",
+              "- A buyer can check these numbers on their own copy: `measure_code.py <repo> --verify measure.json`."]
     L += ["", "## Caveats", "",
           "- Authors are keyed on email; one person with several emails counts more than once.",
-          "- Commit kinds come from message keywords; they are signals, not verified labels.",
+          "- Commit kinds come from message keywords plus the diff shape (a fix must delete lines); they are signals, not verified labels.",
           "- Functions and nesting come from regexes and indentation, not a parser.",
-          "- AI-assisted counts see only trailers and agent accounts; tools that leave neither are invisible.",
+          "- AI-assisted counts see only known agent addresses and product names in trailers and accounts; tools that leave neither are invisible.",
           "- Dates are author dates and can be rewritten by rebases or imports.", ""]
     return "\n".join(L)
+
+
+# --------------------------------------------------------------------------
+# provenance and verification
+# --------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def scripts_digest() -> str:
+    hh = hashlib.sha256()
+    for name in ("measure_code.py", "add_census.py"):
+        f = SCRIPT_DIR / name
+        if f.exists():
+            hh.update(f.read_bytes())
+    return hh.hexdigest()[:32]
+
+
+def payload_digest(doc: dict) -> str:
+    d = json.loads(json.dumps(doc))
+    (d.get("provenance") or {}).pop("payload_digest", None)
+    return hashlib.sha256(json.dumps(d, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
+
+
+STABLE_FIELDS = ("git.commits", "git.merge_commits", "git.authors_human", "git.authors_bot", "git.first_commit", "git.last_commit",
+                 "git.pre_cutoff_commits", "git.pr_merged_count", "git.ai_coauthored_commits", "tree.code_lines_total",
+                 "tree.source_files", "tree.tracked_files", "tests.test_files", "tests.tests_declared", "tasks.candidates_total",
+                 "tasks.capacity.mineable_commits", "fingerprints.root_commits", "fingerprints.commit_sketch",
+                 "fingerprints.content_sketch", "provenance.head_commit_fingerprint", "provenance.measured_commit_fingerprint",
+                 "code_age.share_written_since_cutoff")
+
+
+def dig(doc, path):
+    cur = doc
+    for k in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def verify(claimed_path: Path, repo: Path, a) -> int:
+    claimed = json.loads(claimed_path.read_text("utf-8"))
+    pv = claimed.get("provenance") or {}
+    lines, ok = [], True
+    integ = pv.get("payload_digest") == payload_digest(claimed)
+    lines.append(("payload digest (file unchanged since it was written)", "match" if integ else "MISMATCH"))
+    ok &= integ
+    same_tool = pv.get("scripts_digest") == scripts_digest()
+    lines.append(("scripts digest (same measure-code scripts)", "match" if same_tool else
+                  f"different scripts (file made with {claimed.get('tool_version')}, this copy is {VERSION}); figures may differ for that reason"))
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="measure-code-verify-"))
+    try:
+        argv = [str(repo), "--out", str(tmp / "out"), "--mode", claimed.get("mode", "full"), "--cutoff", claimed.get("cutoff", "2025-01-01"),
+                "--label", claimed.get("label") or "verify", "--build", "detect", "--force",
+                "--blame-seconds", str((claimed.get("code_age") or {}).get("budget_seconds") or 0)]
+        policy = (claimed.get("history_ref") or {}).get("policy")
+        if policy == "all":
+            argv.append("--all-refs")
+        elif policy in ("auto", "head"):
+            argv += ["--ref", policy]
+        rc = main(argv)
+        if rc != 0:
+            print("verify: re-measurement failed")
+            return 2
+        fresh = json.loads((tmp / "out" / "measure.json").read_text("utf-8"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for f in STABLE_FIELDS:
+        x, y = dig(claimed, f), dig(fresh, f)
+        if f == "code_age.share_written_since_cutoff" and (x is None or y is None):
+            lines.append((f, "skipped (blame incomplete on one side)"))
+            continue
+        same = x == y
+        ok &= same
+        lines.append((f, "match" if same else f"MISMATCH (file {str(x)[:40]}, re-measured {str(y)[:40]})"))
+    lines.append(("census and task mining", "not re-derivable: judgement lane, check the sentences by reading the code"))
+    print(f"VERIFY {claimed_path.name} against a fresh measurement")
+    for k, v in lines:
+        print(f"  {k}: {v}")
+    print("verify: " + ("all stable figures match" if ok else "differences found"))
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
+IDEA_KINDS = ("net_new", "bug_repair", "repo_evolution", "long_horizon")
+CENSUS_WEIGHTS = {"complex_logic": 3.0, "substantial_features": 2.5, "work_units": 2.0, "integrations": 1.5,
+                  "performance_work": 1.5, "hardening_work": 1.0, "net_new_capabilities": 1.0, "defect_repairs": 0.75,
+                  "repo_evolutions": 0.75, "defect_repairs_with_test": 0.5}
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Measure one git repository privately (counts only).")
     ap.add_argument("repo", type=Path)
-    ap.add_argument("--out", type=Path, required=True, help="output folder (outside the repo)")
+    ap.add_argument("--out", type=Path, help="output folder (outside the repo); required unless --verify")
     ap.add_argument("--mode", choices=["simple", "full"], default="full",
-                    help="simple = fast listing and metadata, sampled (recommended first run); full = every lane (default)")
+                    help="simple = fast listing and metadata, sampled, every figure an estimate (recommended first run); full = every lane (default)")
     ap.add_argument("--label", help="name shown in the output (default: folder name)")
     ap.add_argument("--tag", action="append", default=[], help="cross-linking tag, e.g. project:alpha (repeatable)")
-    ap.add_argument("--cutoff", default="2025-01-01")
-    ap.add_argument("--all-refs", action="store_true", help="count every branch and tag, not only HEAD")
+    ap.add_argument("--cutoff", default="2025-01-01",
+                    help="date for pre-cutoff shares (default 2025-01-01: buyers price work written before 2025)")
+    ap.add_argument("--ref", choices=["auto", "head"], default="auto",
+                    help="auto (default) = measure history on the deepest branch when it is clearly deeper than HEAD; head = HEAD only")
+    ap.add_argument("--all-refs", action="store_true", help="count the union of every branch and tag")
     ap.add_argument("--sample-files", type=int, default=400, help="simple mode: source files to read")
     ap.add_argument("--build", choices=["detect", "discover", "full"], default="detect",
-                    help="full mode: detect = read manifests (default); discover = run the build; full = build and run tests. "
+                    help="full mode: detect = read manifests (default); discover = build and list tests; full = build and run tests. "
                          "discover/full EXECUTE repo code: use a disposable clone")
+    ap.add_argument("--install", action="store_true",
+                    help="with --build discover/full: install dependencies from the lockfile first. USES THE NETWORK and runs "
+                         "install scripts, with a scratch HOME and credential-like environment variables removed")
+    ap.add_argument("--max-roots", type=int, default=3, help="build probe: project roots to probe, largest first")
     ap.add_argument("--test-timeout", type=int, default=900)
     ap.add_argument("--blame-seconds", type=int, default=300, help="full mode: time budget for the code-age lane (0 = skip)")
+    ap.add_argument("--verify", type=Path, metavar="MEASURE_JSON",
+                    help="re-measure the repo and check an existing measure.json (digests, fingerprints, stable counts)")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--review", action="store_true", help="print every value in the output")
     a = ap.parse_args(argv)
 
     repo = a.repo.expanduser().resolve()
+    if not repo.is_dir():
+        ap.error("repository folder not found")
+    if a.verify:
+        return verify(a.verify.expanduser().resolve(), repo, a)
+    if not a.out:
+        ap.error("--out is required")
     out = a.out.expanduser().resolve()
-    try:
-        git(repo, "rev-parse", "--git-dir")
-    except (RuntimeError, OSError):
-        ap.error("not a git repository")
     if out == repo or repo in out.parents:
         ap.error("--out must be outside the repository")
     out.mkdir(parents=True, exist_ok=True)
     simple = a.mode == "simple"
     st = Stages(out, a.force, a.mode)
-    lanes = {}
-
-    gitres = st.run("git", lambda: stage_git(repo, a.cutoff, a.all_refs, with_files=not simple))
-    lanes["history"] = "metadata only" if simple else "full census"
+    lanes, reasons = {}, []
+    state = repo_state(repo)
+    pathspec = ["--", "."] if state["subtree"] else []
+    ref = None
+    head_fp = measured_fp = None
+    if not state["is_git"]:
+        gitres = empty_history("not_a_git_repository")
+        reasons.append("not_a_git_repository")
+        lanes["history"] = "not run: the folder is not a git repository; only the file tree was measured"
+    elif not state["has_commits"]:
+        gitres = empty_history("no_commits")
+        reasons.append("no_commits")
+        lanes["history"] = "not run: the repository has no commits yet"
+    else:
+        ref = st.run("ref", lambda: choose_ref(repo, "all" if a.all_refs else a.ref, pathspec))
+        gitres = st.run("git", lambda: stage_git(repo, a.cutoff, ref["_rev"], not simple, pathspec))
+        lanes["history"] = ("metadata only" if simple else "full census with lines changed") + (
+            "; folder inside a larger repository, history limited to this folder" if state["subtree"] else "")
+        if gitres.get("history_shallow"):
+            reasons.append("shallow_clone")
+        try:
+            head_fp = h("head:" + git(repo, "rev-parse", "HEAD").strip(), 32)
+            measured_fp = h("head:" + git(repo, "rev-parse", ref["_rev"][0]).strip(), 32) if ref["_rev"][0] != "--all" else None
+        except RuntimeError:
+            pass
     tree = st.run("tree", lambda: stage_tree(repo, a.sample_files if simple else None))
-    lanes["tree"] = "sampled" if simple else "every file read"
+    lanes["tree"] = "sampled (estimate)" if simple else "every file read"
     tests = dict(tree["_tests"])
+    names = [p_ for p_, _ in list_files(repo)]
+    tests["frameworks"] = detect_test_frameworks(repo, names)
     if simple:
         signals = None
-        frameworks = []
-        build = stage_build(repo, "detect", 0, {}, tests)
+        build = stage_build(repo, "detect", 0, tests)
         build["reason"] = "simple mode: no build probe"
         lanes["build"] = "not run (simple mode)"
         code_age = None
@@ -1212,41 +2005,76 @@ def main(argv=None) -> int:
     else:
         signals = st.run("signals", lambda: stage_signals(repo))
         signals["_notebooks"] = tree["_sourcing"]["notebooks"]
-        frameworks = signals["frameworks"]
-        build = st.run(f"build-{a.build}", lambda: stage_build(repo, a.build, a.test_timeout, signals, tests))
-        lanes["build"] = a.build
-        if a.blame_seconds > 0 and not gitres["history_shallow"]:
+        build = st.run(f"build-{a.build}{'-install' if a.install else ''}",
+                       lambda: stage_build(repo, a.build, a.test_timeout, tests, a.install, a.max_roots, tests["frameworks"]))
+        lanes["build"] = a.build + (" with dependency install (network used)" if a.install else "")
+        if a.build == "detect" or build["status"] == "unsupported":
+            reasons.append("build_not_executed")
+        elif build["status"] == "environment_missing":
+            reasons.append("build_environment_missing")
+        elif build["status"] == "timed_out":
+            reasons.append("build_timed_out")
+        if a.blame_seconds > 0 and state["has_commits"] and not gitres.get("history_shallow"):
             code_age = st.run("blame", lambda: stage_blame(repo, a.cutoff, a.blame_seconds))
-            lanes["code_age"] = "complete" if code_age["complete"] else "partial (time budget reached; share covers the largest files)"
+            lanes["code_age"] = "complete" if code_age["complete"] else \
+                f"partial ({code_age['partial_reason'].replace('_', ' ')}; {code_age['coverage_share']:.0%} of lines blamed; no whole-repo share)"
+            if not code_age["complete"]:
+                reasons.append("code_age_partial")
         else:
             code_age = None
             lanes["code_age"] = "skipped"
-    tests["frameworks"] = frameworks
+            if state["has_commits"] and not gitres.get("history_shallow"):
+                reasons.append("code_age_not_run")
     logic = dict(tree["_logic"])
-    band, reasons = logic_band(logic, tests)
-    logic.update(logic_depth=band, reasons=reasons)
+    band, lreasons, lscore = logic_band(logic, tests)
     census = None
     if not simple:
         cp = out / "census.json"
         if cp.exists():
             census = json.loads(cp.read_text("utf-8"))
-            lanes["review"] = "census recorded"
+            lanes["review"] = "census recorded (the session's AI model read the source)"
         else:
-            lanes["review"] = "not run (optional; see add_census.py)"
+            lanes["review"] = "not run: a full run needs the reviewer census and task mining (see add_census.py)"
+            reasons.append("census_not_run")
+    reviewer = census.get("logic_depth") if census else None
+    logic.update(logic_depth=reviewer if reviewer is not None else band,
+                 authoritative="reviewer_census" if reviewer is not None else "deterministic",
+                 deterministic_depth=band, deterministic_score=lscore, reasons=lreasons,
+                 reviewer_depth=reviewer, reviewer_judgement=census.get("reviewer_judgement") if census else None)
+    if simple:
+        task_mining = {"status": "not_run", "skip_reason": "simple_mode", "ideas_total": None, "ideas_by_kind": None, "cap": 150}
+    elif census:
+        tmc = census.get("task_mining") or {}
+        task_mining = {"status": tmc.get("status", "done" if census.get("ideas") else "skipped"),
+                       "skip_reason": tmc.get("skip_reason"), "ideas_total": len(census.get("ideas") or []),
+                       "ideas_by_kind": census.get("ideas_by_kind") or {k: sum(1 for i in census.get("ideas") or [] if i.get("kind") == k) for k in IDEA_KINDS},
+                       "cap": 150, "grounded_ideas": tmc.get("grounded_ideas"), "dropped_ideas": tmc.get("dropped_ideas"),
+                       "kinds_note": "net_new = new capability; bug_repair = a defect fix; repo_evolution = refactor, migration or "
+                                     "performance; long_horizon = multi-step work across modules"}
+        if task_mining["status"] != "done":
+            reasons.append("task_mining_skipped")
+    else:
+        task_mining = {"status": "not_run", "skip_reason": "census_not_run", "ideas_total": None, "ideas_by_kind": None, "cap": 150}
+    lanes["task_mining"] = task_mining["status"] + (f" ({task_mining['skip_reason'].replace('_', ' ')})" if task_mining.get("skip_reason") else "")
     cl = classify(tree["languages"], signals or {"frameworks": []}, build, gitres)
+    reasons = [r for r in STATUS_REASONS if r in reasons or (r == "simple_mode" and simple)]
+    status = "estimate" if simple else ("measured" if not reasons else "partial")
+    ref_block = {k: v for k, v in ref.items() if not k.startswith("_")} if ref else None
 
     doc = {
         "schema": SCHEMA, "kind": "code", "tool": TOOL, "tool_version": VERSION, "mode": a.mode,
-        "status": "measured" if simple or census else "measured_without_review",
+        "status": status, "estimate": simple, "status_reasons": reasons, "skip_reason": reasons[0] if reasons else None,
         "measured_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "label": a.label or repo.name, "tags": a.tag, "cutoff": a.cutoff,
         "span": {"first": gitres["first_commit"], "last": gitres["last_commit"]},
-        "lanes": lanes,
+        "lanes": lanes, "history_ref": ref_block,
         "fingerprints": dict(gitres["_fingerprints"], content_sketch=tree["_content_sketch"]),
         "git": {k: v for k, v in gitres.items() if not k.startswith("_")},
         "tree": {k: v for k, v in tree.items() if not k.startswith("_")},
         "tests": tests, "build": build, "logic": logic, "classification": cl,
-        "tasks": task_block(gitres["_task_signals"]),
+        "tasks": task_block(gitres["_task_signals"], "not run in simple mode" if simple else
+                            "not run: history is truncated or missing" if not state["has_commits"] or gitres.get("history_shallow") else ""),
+        "task_mining": task_mining,
     }
     if not simple:
         sig = {k: v for k, v in signals.items() if not k.startswith("_")}
@@ -1255,23 +2083,28 @@ def main(argv=None) -> int:
         doc["signals"] = sig
         doc["sourcing"] = tree["_sourcing"]
         doc["authenticity"] = dict(tree["_authenticity"], mock_calls=tests.pop("mock_calls"), assertions=tests.pop("assertions"))
-        if gitres["_root_commit_files"] is not None and tree["tracked_files"]:
+        if gitres["_root_commit_files"] is not None and tree["tracked_files"] and gitres.get("history_complete") is not False:
             share = round(min(1.0, gitres["_root_commit_files"] / tree["tracked_files"]), 3)
             doc["authenticity"]["initial_commit_file_share"] = share
-            doc["authenticity"]["looks_like_bulk_import"] = share >= 0.8 and gitres["commits"] < 30
+            doc["authenticity"]["looks_like_bulk_import"] = share >= 0.8 and (gitres["commits"] or 0) < 30
         doc["code_age"] = code_age
         doc["census"] = census
     else:
         tests.pop("mock_calls", None)
         tests.pop("assertions", None)
     doc["recommendation"] = recommend(doc)
-    doc["privacy"] = {"authors": "counted, never named", "paths": "not emitted", "messages": "not emitted"}
+    doc["privacy"] = {"authors": "counted, never named", "paths": "not emitted", "messages": "not emitted",
+                      "review_lane": "the reviewer census is written by the AI model of the session running the skill, "
+                                     "which reads the source under the user's own account; the script itself makes no network calls"}
+    doc["provenance"] = {"head_commit_fingerprint": head_fp, "measured_commit_fingerprint": measured_fp,
+                         "scripts_digest": scripts_digest(), "payload_digest": None}
+    doc["provenance"]["payload_digest"] = payload_digest(doc)
 
-    problems = boundary(doc, author_denylist(repo))
+    problems = boundary(doc, author_denylist(repo) if state["is_git"] else set())
     if problems:
         log("output boundary refused the document, nothing written:")
-        for p in problems[:20]:
-            log("  " + p)
+        for p_ in problems[:20]:
+            log("  " + p_)
         return 2
     row = summary_row(doc)
     atomic_write(out / "measure.json", json.dumps(doc, indent=2))
@@ -1282,12 +2115,19 @@ def main(argv=None) -> int:
         w.writerow(row)
     atomic_write(out / "report.md", render_report(doc))
     log(f"wrote measure.json, summary_row.json/.csv and report.md to {out}")
+    log(f"status: {status}" + (f" ({', '.join(reasons)})" if reasons else ""))
     log(f"full run: {doc['recommendation']['full_run']}")
-    if a.review:
-        kinds = Counter(type(v).__name__ for _, v in leaves(doc))
-        print(f"REVIEW: {sum(kinds.values())} values ({', '.join(f'{k} {n}' for k, n in kinds.items())})")
+    kinds = Counter(type(v).__name__ for _, v in leaves(doc))
+    print(f"REVIEW: {sum(kinds.values())} values ({', '.join(f'{k} {n}' for k, n in kinds.items())}); "
+          f"never collected: author names and emails, file paths and names, commit messages, branch and tag names, "
+          f"environment variable names, secrets, source code")
+    if census:
         for path, v in leaves(doc):
-            if isinstance(v, str) and not path.startswith("fingerprints"):
+            if path.startswith("census") and isinstance(v, str) and path not in ("census.reviewer", "census.model", "census.weights_version"):
+                print(f"  model-written: {path} = {v}")
+    if a.review:
+        for path, v in leaves(doc):
+            if not path.startswith("fingerprints"):
                 print(f"{path} = {v}")
     return 0
 

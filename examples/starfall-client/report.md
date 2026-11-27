@@ -1,14 +1,17 @@
 # Code measurement: starfall-client
 
-Measured 2026-11-20 with measure-code 0.2.0, full mode. Counts only: no names, paths or messages.
+Measured 2026-11-20 with measure-code 0.3.0, full mode. Counts only: no names, paths or messages.
+
+**Status: partial** (build_not_executed)
 
 ## 1. Headline
 
 - 9,400 commits by 14 people (+2 bots), 2019-03-11 to 2024-08-30 (60 active months, 1,140 active days)
-- 165,900 lines of code in 1,036 source files; main language C#; class game
-- Tests: 140 files, 1,260 test cases declared, test/source line ratio 0.12
+- 165,900 lines of code (comments and blank lines excluded; 189,126 non-blank lines with comments) in 1,036 source files; main language C#; class game
+- Tests: 140 files, 1,260 test cases declared, test/source line ratio 0.12; test tools nunit, unity-test-framework
 - 100.0% of commits are dated before 2025-01-01; 0.0% of today's code lines were written after it
-- Logic depth band 6/6; 908 commits change source and tests together
+- Logic depth **4/6** (from the reviewer census; deterministic band 3/6)
+- Capacity: 2,476 mineable commits; 784 commits change source and tests together; 4 mined task ideas
 
 ## 2. History
 
@@ -37,6 +40,8 @@ Measured 2026-11-20 with measure-code 0.2.0, full mode. Counts only: no names, p
 | ai coauthored commits | 0 |
 | ai agent commits | 0 |
 | history shallow | no |
+| history complete | yes |
+| history measured on | head (12 branches compared) |
 
 | year | commits |
 |---|---|
@@ -83,56 +88,86 @@ Authenticity signals: median comment ratio 11.0%; assistant-phrase hits 0; gener
 
 ## 6. Build probe
 
-- level: detect; build systems: none; engine: unity 2021.3.16f1
-- build ok: n/a; tests passed n/a, failed n/a; runnability n/a/4; note: detect level runs nothing
+- level: detect; status **not_run**
+- build systems: none; engine: unity 2021.3.16f1; project roots probed 0 of 0
+- build ok: n/a; tests found in files 1,260, listed by the runner n/a, suite ran n/a; passed n/a, failed n/a
+- discover index n/a; executed runnability n/a; note: detect level runs nothing
 
-## 7. Logic depth
+## 7. Code age
 
-Deterministic band **6/6** (2k+ source lines; 20k+ source lines; dense branching; several deeply nested files; 5+ top-level modules; tests cover 10%+ of source lines).
+Blame complete: 1,036 of 1,036 source files, 100.0% of their lines. 0.0% of today's lines were written after 2025-01-01.
+
+## 8. Logic depth
+
+Authoritative value **4/6** from the reviewer census.
+Deterministic band 3/6 (score 2.82: size 1.00; branching density 0.42; deep nesting 0.21; tests 0.30; modularity 0.89).
 Functions (estimate) 10,578; branch points per 1,000 lines 110.4; nesting depth (95th percentile) 6; files nested 5+ deep 58.
 
-Reviewer census: logic depth **5/6**, self-contained 2/4.
+Reviewer census: weighted total 30.0 gives logic depth **4/6** (the reviewer's own judgement was 5/6); self-contained 2/4; model example-model.
 
-| category | count |
-|---|---|
-| complex logic | 3 |
-| work units | 3 |
-| integrations | 1 |
-| performance work | 1 |
-| hardening work | 1 |
+| category | count | weight |
+|---|---|---|
+| complex logic | 3 | 3.0 |
+| defect repairs | 3 | 0.75 |
+| hardening work | 1 | 1.0 |
+| integrations | 1 | 1.5 |
+| net new capabilities | 2 | 1.0 |
+| performance work | 1 | 1.5 |
+| repo evolutions | 1 | 0.75 |
+| substantial features | 2 | 2.5 |
+| work units | 3 | 2.0 |
+| defect repairs shipped with a test (bonus) | 2 | 0.5 |
 
 Themes: co-op multiplayer action; procedural content; deterministic simulation
 
-## 8. Task candidates
+## 9. Capacity and task candidates
 
-Commits that change source and tests together (1-20 files), by kind.
+Mineable commits (capacity): **2,476**: non-merge, non-bot, not a chore, 2+ first-party non-test source files, 20-8,000 lines changed, at most 40 files in 5 folders. Excluded: 1,118 chores, 239 too spread out. Fix subjects without deleted lines (not counted as fixes): 319. Fixes shipped with a test: 172. Bulk test-add commits: 79.
 
-| kind | with tests | source only | all commits |
-|---|---|---|---|
-| bugfix | 412 | 1,904 | 2,980 |
-| feature | 268 | 1,220 | 2,610 |
-| restructure | 131 | 611 | 830 |
-| exploratory | 97 | 540 | 2,130 |
+| kind | mineable | with tests | source only | all commits |
+|---|---|---|---|---|
+| bugfix | 742 | 288 | 1,904 | 2,086 |
+| feature | 841 | 268 | 1,220 | 2,610 |
+| restructure | 297 | 131 | 611 | 830 |
+| exploratory | 596 | 97 | 540 | 2,130 |
+
+## 10. Task mining
+
+Status: **done**
+
+| kind | ideas |
+|---|---|
+| net new | 1 |
+| bug repair | 1 |
+| repo evolution | 1 |
+| long horizon | 1 |
+| total (cap 150) | 4 |
 
 Generic task ideas:
 
-- bugfix: Stop a networked lobby from accepting a player twice after a dropped reconnect
-- feature: Add a replay recorder that captures input frames and plays them back deterministically
-- restructure: Move save data from a flat binary blob to a versioned schema with migrations
-- exploratory: Profile a slow scene load, find the asset that blocks the main thread, and make it stream
+- bug repair: Stop a networked lobby from accepting a player twice after a dropped reconnect
+- net new: Add a replay recorder that captures input frames and plays them back deterministically
+- repo evolution: Move save data from a flat binary blob to a versioned schema with migrations
+- long horizon: Profile a slow scene load, find the asset that blocks the main thread, and make it stream
 
 ## Lanes
 
-- history: full census
+- history: full census with lines changed
 - tree: every file read
 - build: detect
 - code_age: complete
-- review: census recorded
+- review: census recorded (the session's AI model read the source)
+- task_mining: done
+
+## Provenance
+
+- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `3f56fa4313fb3f885a8171472a7cbeaf`; payload digest `7e9b99407bd1c9de17ac1f0a2aeeb8ad`
+- A buyer can check these numbers on their own copy: `measure_code.py <repo> --verify measure.json`.
 
 ## Caveats
 
 - Authors are keyed on email; one person with several emails counts more than once.
-- Commit kinds come from message keywords; they are signals, not verified labels.
+- Commit kinds come from message keywords plus the diff shape (a fix must delete lines); they are signals, not verified labels.
 - Functions and nesting come from regexes and indentation, not a parser.
-- AI-assisted counts see only trailers and agent accounts; tools that leave neither are invisible.
+- AI-assisted counts see only known agent addresses and product names in trailers and accounts; tools that leave neither are invisible.
 - Dates are author dates and can be rewritten by rebases or imports.

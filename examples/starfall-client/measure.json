@@ -2,7 +2,14 @@
   "schema": "october.measure/v1",
   "kind": "code",
   "tool": "measure-code",
-  "tool_version": "0.2.0",
+  "tool_version": "0.3.0",
+  "mode": "full",
+  "status": "partial",
+  "estimate": false,
+  "status_reasons": [
+    "build_not_executed"
+  ],
+  "skip_reason": "build_not_executed",
   "measured_at": "2026-11-20T10:00:00Z",
   "label": "starfall-client",
   "tags": [
@@ -12,6 +19,23 @@
   "span": {
     "first": "2019-03-11",
     "last": "2024-08-30"
+  },
+  "lanes": {
+    "history": "full census with lines changed",
+    "tree": "every file read",
+    "build": "detect",
+    "code_age": "complete",
+    "review": "census recorded (the session's AI model read the source)",
+    "task_mining": "done"
+  },
+  "history_ref": {
+    "policy": "auto",
+    "refs_considered": 12,
+    "head_commits": 9400,
+    "deepest_ref_commits": 9400,
+    "measured": "head",
+    "measured_commits": 9400,
+    "deeper_ref_exists": false
   },
   "fingerprints": {
     "root_commits": [
@@ -572,7 +596,9 @@
     "ai_coauthored_commits": 0,
     "ai_agent_commits": 0,
     "ai_assisted_share": 0.0,
-    "commits_by_month": {}
+    "commits_by_month": {},
+    "history_complete": true,
+    "history_note": null
   },
   "tree": {
     "mode_note": null,
@@ -617,16 +643,9 @@
       "3d": 96
     },
     "files_over_500_lines": 41,
-    "files_over_1000_lines": 9
-  },
-  "mode": "full",
-  "status": "measured",
-  "lanes": {
-    "history": "full census",
-    "tree": "every file read",
-    "build": "detect",
-    "code_age": "complete",
-    "review": "census recorded"
+    "files_over_1000_lines": 9,
+    "code_lines_definition": "non-blank lines that are not comments, tracked first-party files",
+    "nonblank_lines_total": 189126
   },
   "tests": {
     "test_files": 140,
@@ -644,7 +663,7 @@
     "engine": "unity",
     "engine_version": "2021.3.16f1",
     "host_os": "linux",
-    "tests_declared": null,
+    "tests_declared": 1260,
     "dependencies_present": null,
     "build_ok": null,
     "tests_ran": null,
@@ -654,7 +673,19 @@
     "runnability": null,
     "reason": "detect level runs nothing",
     "timed_out": false,
-    "seconds": 0
+    "seconds": 0,
+    "install": false,
+    "network_used": false,
+    "tests_found": 1260,
+    "roots_found": 0,
+    "roots_probed": 0,
+    "roots_skipped": 0,
+    "roots": [],
+    "status": "not_run",
+    "failure_class": null,
+    "repo_intrinsic_failure": null,
+    "tests_collected": null,
+    "discover_index": null
   },
   "logic": {
     "functions_estimate": 10578,
@@ -664,37 +695,20 @@
     "files_nesting_5plus": 58,
     "top_level_modules": 9,
     "source_code_lines": 148100,
-    "logic_depth": 6,
+    "logic_depth": 4,
     "reasons": [
-      "2k+ source lines",
-      "20k+ source lines",
-      "dense branching",
-      "several deeply nested files",
-      "5+ top-level modules",
-      "tests cover 10%+ of source lines"
-    ]
-  },
-  "tasks": {
-    "method": "deterministic commit census (message keywords + files touched); counts only",
-    "candidates": {
-      "bugfix": 412,
-      "feature": 268,
-      "restructure": 131,
-      "exploratory": 97
-    },
-    "candidates_total": 908,
-    "source_only_candidates": {
-      "bugfix": 1904,
-      "feature": 1220,
-      "restructure": 611,
-      "exploratory": 540
-    },
-    "commit_kinds": {
-      "bugfix": 2980,
-      "feature": 2610,
-      "restructure": 830,
-      "exploratory": 2130
-    }
+      "size 1.00",
+      "branching density 0.42",
+      "deep nesting 0.21",
+      "tests 0.30",
+      "modularity 0.89"
+    ],
+    "files_nesting_5plus_share": 0.056,
+    "authoritative": "reviewer_census",
+    "deterministic_depth": 3,
+    "deterministic_score": 2.82,
+    "reviewer_depth": 4,
+    "reviewer_judgement": 5
   },
   "classification": {
     "primary_class": "game",
@@ -704,7 +718,68 @@
     },
     "is_monorepo": false,
     "is_likely_demo": false,
-    "demo_reasons": []
+    "demo_reasons": [],
+    "demo_strong_signals": 0,
+    "demo_weak_signals": 0
+  },
+  "tasks": {
+    "method": "deterministic commit census (strict message kinds, lines changed, files and folders touched); counts only",
+    "candidates": {
+      "bugfix": 288,
+      "feature": 268,
+      "restructure": 131,
+      "exploratory": 97
+    },
+    "candidates_total": 784,
+    "source_only_candidates": {
+      "bugfix": 1904,
+      "feature": 1220,
+      "restructure": 611,
+      "exploratory": 540
+    },
+    "commit_kinds": {
+      "bugfix": 2086,
+      "feature": 2610,
+      "restructure": 830,
+      "exploratory": 2130
+    },
+    "capacity": {
+      "mineable_commits": 2476,
+      "mineable_by_kind": {
+        "bugfix": 742,
+        "feature": 841,
+        "restructure": 297,
+        "exploratory": 596
+      },
+      "rule": {
+        "min_impl_files": 2,
+        "max_files": 40,
+        "max_dirs": 5,
+        "min_churn": 20,
+        "max_churn": 8000
+      },
+      "chore_commits_excluded": 1118,
+      "too_spread_commits_excluded": 239,
+      "bulk_test_commits": 79,
+      "fix_subjects_not_corroborated": 319,
+      "bugfix_with_regression_test": 172,
+      "lines_changed_first_party": 1907850
+    }
+  },
+  "task_mining": {
+    "status": "done",
+    "skip_reason": null,
+    "ideas_total": 4,
+    "ideas_by_kind": {
+      "net_new": 1,
+      "bug_repair": 1,
+      "repo_evolution": 1,
+      "long_horizon": 1
+    },
+    "cap": 150,
+    "grounded_ideas": 4,
+    "dropped_ideas": 3,
+    "kinds_note": "net_new = new capability; bug_repair = a defect fix; repo_evolution = refactor, migration or performance; long_horizon = multi-step work across modules"
   },
   "signals": {
     "docs": {
@@ -777,7 +852,8 @@
     },
     "demo_words": {},
     "health_endpoint": false,
-    "metrics": false
+    "metrics": false,
+    "scaffolds": []
   },
   "sourcing": {
     "loc_first_party": 165900,
@@ -802,11 +878,22 @@
     "lines_written_since_cutoff": 0,
     "share_written_since_cutoff": 0.0,
     "complete": true,
-    "budget_seconds": 300
+    "budget_seconds": 300,
+    "status": "complete",
+    "partial_reason": null,
+    "files_failed": 0,
+    "lines_total": 142674,
+    "coverage_share": 1.0,
+    "share_in_blamed_lines": 0.0,
+    "cutoff": "2025-01-01"
   },
   "census": {
     "reviewer": "agent",
-    "logic_depth": 5,
+    "model": "example-model",
+    "weights_version": "october-census-weights/1",
+    "logic_depth": 4,
+    "weighted_total": 30.0,
+    "reviewer_judgement": 5,
     "self_contained": 2,
     "categories": {
       "complex_logic": [
@@ -814,46 +901,91 @@
         "Procedural level assembly from weighted room templates",
         "Behaviour trees driving enemy squads with shared blackboard state"
       ],
-      "work_units": [
-        "Save and load pipeline with versioned migrations",
-        "Inventory and crafting rules",
-        "Matchmaking client with region selection"
+      "defect_repairs": [
+        "Desync after a dropped packet fixed by resending the missing input frames",
+        "Save corruption on power loss fixed by writing to a temporary file and swapping",
+        "Memory growth in long sessions fixed by releasing pooled effects on scene change"
+      ],
+      "hardening_work": [
+        "Reconnect handling for dropped multiplayer sessions"
       ],
       "integrations": [
         "Platform achievements and cloud saves behind one interface"
       ],
+      "net_new_capabilities": [
+        "Spectator mode that replays a finished match from recorded inputs",
+        "Controller remapping with per-device profiles"
+      ],
       "performance_work": [
         "Object pooling for projectiles and particle bursts"
       ],
-      "hardening_work": [
-        "Reconnect handling for dropped multiplayer sessions"
+      "repo_evolutions": [
+        "Input handling moved from polling to an event queue shared by every scene"
+      ],
+      "substantial_features": [
+        "Cross-platform cloud saves with conflict resolution between devices",
+        "Seasonal event system that swaps rules, rewards and level pools on a schedule"
+      ],
+      "work_units": [
+        "Save and load pipeline with versioned migrations",
+        "Inventory and crafting rules",
+        "Matchmaking client with region selection"
       ]
     },
+    "category_counts": {
+      "complex_logic": 3,
+      "defect_repairs": 3,
+      "hardening_work": 1,
+      "integrations": 1,
+      "net_new_capabilities": 2,
+      "performance_work": 1,
+      "repo_evolutions": 1,
+      "substantial_features": 2,
+      "work_units": 3
+    },
+    "defect_repairs_with_test": 2,
     "themes": [
       "co-op multiplayer action",
       "procedural content",
       "deterministic simulation"
     ],
     "summary": "A co-op action game client with networked play, procedural levels and a tested simulation core.",
+    "what_could_not_be_assessed": [
+      "Runtime behaviour on consoles, since no console build could be run"
+    ],
     "ideas": [
       {
-        "kind": "bugfix",
+        "kind": "bug_repair",
         "text": "Stop a networked lobby from accepting a player twice after a dropped reconnect"
       },
       {
-        "kind": "feature",
+        "kind": "net_new",
         "text": "Add a replay recorder that captures input frames and plays them back deterministically"
       },
       {
-        "kind": "restructure",
+        "kind": "repo_evolution",
         "text": "Move save data from a flat binary blob to a versioned schema with migrations"
       },
       {
-        "kind": "exploratory",
+        "kind": "long_horizon",
         "text": "Profile a slow scene load, find the asset that blocks the main thread, and make it stream"
       }
     ],
-    "dropped_sentences": 1
+    "ideas_by_kind": {
+      "net_new": 1,
+      "bug_repair": 1,
+      "repo_evolution": 1,
+      "long_horizon": 1
+    },
+    "ideas_total": 4,
+    "task_mining": {
+      "status": "done",
+      "skip_reason": null,
+      "grounded_ideas": 4,
+      "dropped_ideas": 3,
+      "cap": 150
+    },
+    "dropped_sentences": 3
   },
   "recommendation": {
     "full_run": "already full",
@@ -863,6 +995,13 @@
   "privacy": {
     "authors": "counted, never named",
     "paths": "not emitted",
-    "messages": "not emitted"
+    "messages": "not emitted",
+    "review_lane": "the reviewer census is written by the AI model of the session running the skill, which reads the source under the user's own account; the script itself makes no network calls"
+  },
+  "provenance": {
+    "head_commit_fingerprint": "87f4aae41790b7d5fdde6e029649aa7f",
+    "measured_commit_fingerprint": "87f4aae41790b7d5fdde6e029649aa7f",
+    "scripts_digest": "3f56fa4313fb3f885a8171472a7cbeaf",
+    "payload_digest": "7e9b99407bd1c9de17ac1f0a2aeeb8ad"
   }
 }
