@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds throwaway synthetic git repos and checks full mode, simple mode, the census and task mining,
 # capacity, branch selection, the build probe, edge cases (empty, non-git, shallow), verification and
-# the output boundary.
+# the output boundary, the status rules (a build nobody asked for is info, not partial) and dream mode.
 # Usage: bash tests/selftest.sh   (PY=/path/to/python3 to pick an interpreter)
 set -euo pipefail
 PY="${PY:-python3}"
@@ -98,6 +98,9 @@ EOF
 "$PY" "$C" "$WORK/census.json" --out "$WORK/full" --repo "$REPO" 2>/dev/null >/dev/null
 "$PY" "$M" "$REPO" --out "$WORK/full" --label demo-repo --build discover --blame-seconds 60 >/dev/null
 "$PY" "$M" "$REPO" --out "$WORK/fullbuild" --label demo-repo --build full --blame-seconds 0 >/dev/null
+# The default build level (detect) with every default lane done is `measured`; the build is info only.
+mkdir -p "$WORK/detect" && cp "$WORK/full/census.json" "$WORK/detect/census.json"
+"$PY" "$M" "$REPO" --out "$WORK/detect" --label demo-repo --blame-seconds 60 >/dev/null
 
 # Edge cases: empty repository, folder without git, shallow clone.
 mkdir "$WORK/empty" && git -C "$WORK/empty" init -q
@@ -122,7 +125,7 @@ import csv, json, sys, pathlib
 w = pathlib.Path(sys.argv[1])
 load = lambda p: json.loads((w / p / "measure.json").read_text())
 d = load("full")
-assert d["schema"] == "october.measure/v1" and d["kind"] == "code" and d["mode"] == "full" and d["tool_version"] == "0.3.0"
+assert d["schema"] == "october.measure/v1" and d["kind"] == "code" and d["mode"] == "full" and d["tool_version"] == "0.4.0"
 g = d["git"]
 assert g["commits"] == 9 and g["authors_human"] == 4 and g["authors_bot"] == 1, g
 assert g["pre_cutoff_commits"] == 2 and g["history_complete"] is True, g
@@ -225,5 +228,66 @@ assert m.boundary({"git": {"note": "secret/path.py"}}, set())
 assert m.boundary({"census": {"summary": "written by someone@example.com"}}, set())
 assert not m.boundary({"label": "x", "git": {"first_commit": "2020-01-01"}}, set())
 print("selftest: units and boundary OK")
+EOF
+# Dream mode: validate and insert "Why this is special", keep it on re-runs, refuse bad drafts, honour --no-dream.
+D="$HERE/scripts/add_dream.py"
+cat > "$WORK/dream.txt" <<'EOF'
+This little arithmetic library punches well above its size. Across 9 commits, 4 people turned a one-line helper into
+input-checked math with a real test suite behind it. CI runs those tests on every push, and the crash fix shipped
+together with the test that guards it. It is small, but it was built the way careful teams build big things.
+EOF
+"$PY" "$D" "$WORK/dream.txt" --out "$WORK/detect" --repo "$REPO" --check 2>/dev/null
+if grep -q "Why this is special" "$WORK/detect/report.md"; then echo "--check wrote the section"; exit 1; fi
+"$PY" "$D" "$WORK/dream.txt" --out "$WORK/detect" --repo "$REPO" >/dev/null 2>&1
+"$PY" "$M" "$REPO" --verify "$WORK/detect/measure.json" >/dev/null   # the payload digest covers the inserted pitch
+"$PY" "$M" "$REPO" --out "$WORK/detect" --label demo-repo --blame-seconds 60 >/dev/null 2>&1   # a re-run keeps it
+refuse() {  # name, draft text: add_dream must refuse it
+  printf '%s\n' "$2" > "$WORK/bad.txt"
+  if "$PY" "$D" "$WORK/bad.txt" --out "$WORK/detect" --repo "$REPO" --check 2>/dev/null; then echo "dream accepted: $1"; exit 1; fi
+}
+refuse empty ""
+refuse too-short "Great repo. Ships tests. Built with care."
+refuse too-long "$(for i in 1 2 3 4 5 6 7; do printf 'It has 9 commits of careful work. '; done)"
+refuse email "It has 9 commits of careful work. Ask one@example.com for more. Tests run in CI. It is small but polished."
+refuse path "It has 9 commits of careful work. The heart lives in src/ops/mul.py today. Tests run in CI. It is small but polished."
+refuse file-name "It has 9 commits of careful work. The core sits in one README.md file. Tests run in CI. It is small but polished."
+refuse author "It has 9 commits of careful work. Dev One wrote most of it with love. Tests run in CI. It is small but polished."
+refuse invented-number "It has 9 commits of careful work. It already serves 250,000 players a day. Tests run in CI. It is small but polished."
+refuse url "It has 9 commits of careful work. See https://example.org/store for the page. Tests run in CI. It is small but polished."
+refuse secret "It has 9 commits of careful work. The key AKIA$(printf "%s" ABCDEFGHIJKLMNOP) sits in config. Tests run in CI. It is small but polished."
+refuse bullets "- It has 9 commits of careful work.
+- Tests run in CI.
+- It is small.
+- It is polished."
+# --no-dream: on the measurement, and on an existing output through add_dream.
+"$PY" "$M" "$REPO" --out "$WORK/nodream" --label demo-repo --blame-seconds 0 --no-dream >/dev/null 2>&1
+cp -R "$WORK/detect" "$WORK/declined" && "$PY" "$D" --no-dream --out "$WORK/declined" >/dev/null 2>&1
+if "$PY" "$D" "$WORK/dream.txt" --out "$WORK/declined" 2>/dev/null; then echo "dream added after --no-dream"; exit 1; fi
+# The shipped synthetic example passes the same checks against its own report.
+"$PY" "$D" "$HERE/examples/starfall-client/dream.txt" --out "$HERE/examples/starfall-client" --check 2>/dev/null
+"$PY" - "$WORK" <<'EOF'
+import csv, json, sys, pathlib
+w = pathlib.Path(sys.argv[1])
+load = lambda p: json.loads((w / p / "measure.json").read_text())
+d = load("detect")
+assert d["status"] == "measured" and d["status_reasons"] == [], (d["status"], d["status_reasons"])
+assert d["status_info"] == {"build": "not_requested"} and d["build"]["status"] == "not_requested", (d["status_info"], d["build"]["status"])
+rep = (w / "detect/report.md").read_text()
+assert "**Status: measured**" in rep and "info: build not_requested" in rep, rep[:400]
+dr = d["dream"]
+assert dr["status"] == "written" and dr["title"] == "Why this is special" and dr["sentences"] == 4 and "9 commits" in dr["text"], dr
+assert rep.rstrip().endswith("careful teams build big things."), rep[-300:]
+assert rep.index("## Why this is special") > rep.index("## Caveats"), "the pitch comes last, after the measured sections"
+assert "not a measurement" in rep.split("## Why this is special")[1]
+row = list(csv.DictReader(open(w / "detect/summary_row.csv")))[0]
+assert row["status"] == "measured" and row["status_info"] == "build:not_requested" and row["dream_status"] == "written", row
+nd = load("nodream")
+assert nd["dream"]["status"] == "skipped" and "Why this is special" not in (w / "nodream/report.md").read_text()
+assert "code_age_not_run" in nd["status_reasons"] and nd["status"] == "partial", "an explicitly skipped lane is still partial"
+dc = load("declined")
+assert dc["dream"]["status"] == "skipped" and "Why this is special" not in (w / "declined/report.md").read_text()
+assert json.loads((w / "declined/dream.json").read_text())["status"] == "skipped"
+assert load("full")["dream"]["status"] == "pending" and "Why this is special" not in (w / "full/report.md").read_text()
+print("selftest: status rules and dream mode OK")
 EOF
 echo "selftest: passed"

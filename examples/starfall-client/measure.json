@@ -2,14 +2,15 @@
   "schema": "october.measure/v1",
   "kind": "code",
   "tool": "measure-code",
-  "tool_version": "0.3.0",
+  "tool_version": "0.4.0",
   "mode": "full",
-  "status": "partial",
+  "status": "measured",
   "estimate": false,
-  "status_reasons": [
-    "build_not_executed"
-  ],
-  "skip_reason": "build_not_executed",
+  "status_reasons": [],
+  "skip_reason": null,
+  "status_info": {
+    "build": "not_requested"
+  },
   "measured_at": "2026-11-20T10:00:00Z",
   "label": "starfall-client",
   "tags": [
@@ -26,7 +27,8 @@
     "build": "detect",
     "code_age": "complete",
     "review": "census recorded (the session's AI model read the source)",
-    "task_mining": "done"
+    "task_mining": "done",
+    "dream": "why this is special written by the agent after the audit (not a measurement)"
   },
   "history_ref": {
     "policy": "auto",
@@ -671,7 +673,7 @@
     "tests_failed": null,
     "test_pass_rate": null,
     "runnability": null,
-    "reason": "detect level runs nothing",
+    "reason": "detect level reads manifests only; no build was requested",
     "timed_out": false,
     "seconds": 0,
     "install": false,
@@ -681,7 +683,7 @@
     "roots_probed": 0,
     "roots_skipped": 0,
     "roots": [],
-    "status": "not_run",
+    "status": "not_requested",
     "failure_class": null,
     "repo_intrinsic_failure": null,
     "tests_collected": null,
@@ -998,10 +1000,19 @@
     "messages": "not emitted",
     "review_lane": "the reviewer census is written by the AI model of the session running the skill, which reads the source under the user's own account; the script itself makes no network calls"
   },
+  "dream": {
+    "title": "Why this is special",
+    "status": "written",
+    "text": "This is a full co-op action game client, not a prototype: 14 people put 9,400 commits into it between 2019 and 2024. Under the hood it runs a deterministic simulation with procedural levels and networked play, which is the hard kind of game code to get right. The team cared about craft, with 1,260 test cases, 37 release tags and 1,034 merged pull requests behind it. All 165,900 lines were written before 2025, so this is years of human game-making, not a weekend of generated code.",
+    "sentences": 4,
+    "words": 86,
+    "skip_reason": null,
+    "basis": "Founder-style pitch written by the AI agent after the audit, grounded only in what this run inspected. It is not a measurement and changes no count."
+  },
   "provenance": {
     "head_commit_fingerprint": "87f4aae41790b7d5fdde6e029649aa7f",
     "measured_commit_fingerprint": "87f4aae41790b7d5fdde6e029649aa7f",
-    "scripts_digest": "3f56fa4313fb3f885a8171472a7cbeaf",
-    "payload_digest": "7e9b99407bd1c9de17ac1f0a2aeeb8ad"
+    "scripts_digest": "7b25759288d604ad409b92cbdb81b3c1",
+    "payload_digest": "b33b14a03a0840510c2628ef210aeb98"
   }
 }

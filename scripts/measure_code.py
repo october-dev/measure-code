@@ -13,6 +13,11 @@ Two modes:
                   repo code), and the reviewer census and task mining written
                   with add_census.py, which a full run requires.
 
+Dream mode: after the audit the agent writes a short "Why this is special" pitch
+with add_dream.py. It lands in the `dream` block of measure.json and in the last
+section of report.md, labelled and kept apart from the measured sections.
+--no-dream skips it.
+
 Writes into --out:
 
   measure.json          all counts (schema october.measure/v1, kind "code")
@@ -50,7 +55,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 TOOL = "measure-code"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA = "october.measure/v1"
 SKETCH_K = 256
 TASK_KINDS = ("bugfix", "feature", "restructure", "exploratory")
@@ -1261,13 +1266,13 @@ def stage_build(repo: Path, level: str, timeout: int, tests: dict, install: bool
         "host_os": {"Darwin": "darwin", "Linux": "linux", "Windows": "windows"}.get(platform.system(), "other"),
         "tests_found": tests.get("tests_declared"), "tests_declared": tests.get("tests_declared"),
         "roots_found": len(roots), "roots_probed": 0, "roots_skipped": 0, "roots": [],
-        "status": "not_run", "failure_class": None, "repo_intrinsic_failure": None,
+        "status": "not_requested" if level == "detect" else "not_run", "failure_class": None, "repo_intrinsic_failure": None,
         "dependencies_present": None, "build_ok": None, "tests_collected": None, "tests_ran": None, "tests_passed": None,
         "tests_failed": None, "test_pass_rate": None, "discover_index": None, "runnability": None, "reason": None,
         "timed_out": False, "seconds": 0,
     }
     if level == "detect":
-        out["reason"] = "detect level runs nothing"
+        out["reason"] = "detect level reads manifests only; no build was requested"
         return out
     if engine in ("unity", "unreal") and not any(r[1] != "dotnet" for r in roots):
         out.update(status="environment_missing", failure_class="environment",
@@ -1501,9 +1506,13 @@ def task_block(sig: dict | None, reason: str = "not run in simple mode") -> dict
     }
 
 
+# Reasons a full run is `partial`: something failed, timed out or was skipped. A build the user did not ask for
+# (the default --build detect) is not one of them; it is recorded as status_info.build = "not_requested".
 STATUS_REASONS = ("simple_mode", "not_a_git_repository", "no_commits", "shallow_clone", "census_not_run",
-                  "task_mining_skipped", "build_not_executed", "build_environment_missing", "build_timed_out",
-                  "code_age_partial", "code_age_not_run")
+                  "task_mining_skipped", "build_failed", "tests_failed", "build_environment_missing", "build_timed_out",
+                  "build_unsupported", "code_age_partial", "code_age_not_run")
+BUILD_REASON = {"build_failed": "build_failed", "tests_failed": "tests_failed", "environment_missing": "build_environment_missing",
+                "timed_out": "build_timed_out", "unsupported": "build_unsupported"}
 
 
 def recommend(doc: dict) -> dict:
@@ -1530,6 +1539,7 @@ def recommend(doc: dict) -> dict:
 
 STRING_FIELDS = [re.compile(p) for p in (
     r"^schema$", r"^kind$", r"^tool$", r"^tool_version$", r"^mode$", r"^status$", r"^status_reasons\[\d+\]$", r"^skip_reason$",
+    r"^status_info\.\w+$", r"^dream\.(title|status|text|basis|skip_reason)$",
     r"^measured_at$", r"^label$", r"^tags\[\d+\]$", r"^cutoff$", r"^span\.(first|last)$", r"^git\.(first|last)_commit$",
     r"^git\.history_note$", r"^history_ref\.(policy|measured)$",
     r"^fingerprints\.\w+\[\d+\]$", r"^tree\.(mode_note|code_lines_definition)$", r"^lanes\.\w+$", r"^tests\.frameworks\[\d+\]$",
@@ -1588,7 +1598,7 @@ def boundary(doc: dict, denylist: set) -> list:
             problems.append(f"{path}: looks like an email address")
         if ABS_PATH_RX.search(v):
             problems.append(f"{path}: looks like an absolute path")
-        if path.startswith("census") or path == "build.engine_version":
+        if path.startswith("census") or path in ("build.engine_version", "dream.text"):
             low = v.lower()
             if any(re.search(r"(?<![a-z0-9])" + re.escape(d) + r"(?![a-z0-9])", low) for d in deny):
                 problems.append(f"{path}: contains an author name or email from the history")
@@ -1602,7 +1612,11 @@ def author_denylist(repo: Path) -> set:
             out.update(p.lower() for p in line.split("\x1f") if len(p) >= 4)
     except RuntimeError:
         pass
-    return out
+    # hosting services and bots commit too; they are not people, and "GitHub" must stay usable in sentences
+    return {d for d in out if d not in SERVICE_IDENTITIES and "[bot]" not in d and "noreply" not in d}
+
+
+SERVICE_IDENTITIES = {"github", "gitlab", "bitbucket", "web-flow", "github enterprise", "azure devops", "gitea", "codeberg"}
 
 
 # --------------------------------------------------------------------------
@@ -1637,6 +1651,7 @@ def summary_row(doc: dict) -> dict:
     row = {
         "label": doc["label"], "mode": doc["mode"], "status": doc["status"], "estimate": doc["estimate"],
         "status_reasons": ";".join(doc["status_reasons"]) or None, "skip_reason": doc["skip_reason"],
+        "status_info": ";".join(f"{k}:{v}" for k, v in (doc.get("status_info") or {}).items()) or None,
         "measured_at": doc["measured_at"],
         "primary_language": next(iter(t["languages"]), None), "languages": len(t["languages"]),
         "code_lines": t["code_lines_total"], "nonblank_lines": t.get("nonblank_lines_total"), "source_files": t["source_files"],
@@ -1660,6 +1675,7 @@ def summary_row(doc: dict) -> dict:
         "deterministic_logic_depth": lg["deterministic_depth"], "reviewer_logic_depth": lg["reviewer_depth"],
         "capacity": cap.get("mineable_commits"), "task_candidates": tk["candidates_total"],
         "task_mining_status": tm.get("status"), "mined_ideas": tm.get("ideas_total"),
+        "dream_status": (doc.get("dream") or {}).get("status"),
     }
     for k in IDEA_KINDS:
         row[f"mined_{k}"] = (tm.get("ideas_by_kind") or {}).get(k) if tm.get("ideas_by_kind") else None
@@ -1679,7 +1695,8 @@ def render_report(doc: dict) -> str:
     L = [f"# Code measurement: {doc['label']}" + (" (simple mode)" if simple else ""), "",
          f"Measured {doc['measured_at'][:10]} with {TOOL} {VERSION}, {doc['mode']} mode. Counts only: no names, paths or messages.",
          "", f"**Status: {doc['status']}**" + (f" ({', '.join(doc['status_reasons'])})" if doc["status_reasons"] else
-                                              " (every lane ran, including the reviewer census and task mining)")]
+                                              " (every lane ran, including the reviewer census and task mining)")
+         + "".join(f"; info: {k} {v}" for k, v in (doc.get("status_info") or {}).items())]
     if simple:
         L += ["", "_Every figure in this report is an estimate from metadata and a file sample. Run full mode for measured numbers._"]
     if t.get("mode_note"):
@@ -1827,6 +1844,7 @@ def render_report(doc: dict) -> str:
           "- Functions and nesting come from regexes and indentation, not a parser.",
           "- AI-assisted counts see only known agent addresses and product names in trailers and accounts; tools that leave neither are invisible.",
           "- Dates are author dates and can be rewritten by rebases or imports.", ""]
+    L += dream_mod().section(doc.get("dream"))
     return "\n".join(L)
 
 
@@ -1837,9 +1855,18 @@ def render_report(doc: dict) -> str:
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+def dream_mod():
+    """add_dream.py next to this script: the dream slot, its validation and its report section."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("add_dream", SCRIPT_DIR / "add_dream.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def scripts_digest() -> str:
     hh = hashlib.sha256()
-    for name in ("measure_code.py", "add_census.py"):
+    for name in ("measure_code.py", "add_census.py", "add_dream.py"):
         f = SCRIPT_DIR / name
         if f.exists():
             hh.update(f.read_bytes())
@@ -1906,6 +1933,8 @@ def verify(claimed_path: Path, repo: Path, a) -> int:
         ok &= same
         lines.append((f, "match" if same else f"MISMATCH (file {str(x)[:40]}, re-measured {str(y)[:40]})"))
     lines.append(("census and task mining", "not re-derivable: judgement lane, check the sentences by reading the code"))
+    if (claimed.get("dream") or {}).get("status") == "written":
+        lines.append(("why this is special", "not re-derivable: a labelled pitch written by the agent, not a measurement"))
     print(f"VERIFY {claimed_path.name} against a fresh measurement")
     for k, v in lines:
         print(f"  {k}: {v}")
@@ -1950,6 +1979,8 @@ def main(argv=None) -> int:
                     help="re-measure the repo and check an existing measure.json (digests, fingerprints, stable counts)")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--review", action="store_true", help="print every value in the output")
+    ap.add_argument("--no-dream", action="store_true",
+                    help="skip dream mode: no 'Why this is special' pitch is written after the audit")
     a = ap.parse_args(argv)
 
     repo = a.repo.expanduser().resolve()
@@ -1965,7 +1996,7 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     simple = a.mode == "simple"
     st = Stages(out, a.force, a.mode)
-    lanes, reasons = {}, []
+    lanes, reasons, info = {}, [], {}
     state = repo_state(repo)
     pathspec = ["--", "."] if state["subtree"] else []
     ref = None
@@ -2008,12 +2039,10 @@ def main(argv=None) -> int:
         build = st.run(f"build-{a.build}{'-install' if a.install else ''}",
                        lambda: stage_build(repo, a.build, a.test_timeout, tests, a.install, a.max_roots, tests["frameworks"]))
         lanes["build"] = a.build + (" with dependency install (network used)" if a.install else "")
-        if a.build == "detect" or build["status"] == "unsupported":
-            reasons.append("build_not_executed")
-        elif build["status"] == "environment_missing":
-            reasons.append("build_environment_missing")
-        elif build["status"] == "timed_out":
-            reasons.append("build_timed_out")
+        if a.build == "detect":
+            info["build"] = "not_requested"
+        elif build["status"] in BUILD_REASON:
+            reasons.append(BUILD_REASON[build["status"]])
         if a.blame_seconds > 0 and state["has_commits"] and not gitres.get("history_shallow"):
             code_age = st.run("blame", lambda: stage_blame(repo, a.cutoff, a.blame_seconds))
             lanes["code_age"] = "complete" if code_age["complete"] else \
@@ -2064,6 +2093,7 @@ def main(argv=None) -> int:
     doc = {
         "schema": SCHEMA, "kind": "code", "tool": TOOL, "tool_version": VERSION, "mode": a.mode,
         "status": status, "estimate": simple, "status_reasons": reasons, "skip_reason": reasons[0] if reasons else None,
+        "status_info": info,
         "measured_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "label": a.label or repo.name, "tags": a.tag, "cutoff": a.cutoff,
         "span": {"first": gitres["first_commit"], "last": gitres["last_commit"]},
@@ -2096,11 +2126,18 @@ def main(argv=None) -> int:
     doc["privacy"] = {"authors": "counted, never named", "paths": "not emitted", "messages": "not emitted",
                       "review_lane": "the reviewer census is written by the AI model of the session running the skill, "
                                      "which reads the source under the user's own account; the script itself makes no network calls"}
+    deny = author_denylist(repo) if state["is_git"] else set()
+    dm = dream_mod()
+    doc["dream"] = dm.pending()
+    doc["dream"] = dm.resolve(out, dm.ground_text(doc, render_report(doc)), a.no_dream, deny)
+    lanes["dream"] = {"written": "why this is special written by the agent after the audit (not a measurement)",
+                      "skipped": "skipped (--no-dream)", "pending": "pending: the agent writes it after the audit (add_dream.py)",
+                      "needs_rewrite": "the saved pitch no longer matches these numbers; write it again"}[doc["dream"]["status"]]
     doc["provenance"] = {"head_commit_fingerprint": head_fp, "measured_commit_fingerprint": measured_fp,
                          "scripts_digest": scripts_digest(), "payload_digest": None}
     doc["provenance"]["payload_digest"] = payload_digest(doc)
 
-    problems = boundary(doc, author_denylist(repo) if state["is_git"] else set())
+    problems = boundary(doc, deny)
     if problems:
         log("output boundary refused the document, nothing written:")
         for p_ in problems[:20]:
@@ -2121,6 +2158,8 @@ def main(argv=None) -> int:
     print(f"REVIEW: {sum(kinds.values())} values ({', '.join(f'{k} {n}' for k, n in kinds.items())}); "
           f"never collected: author names and emails, file paths and names, commit messages, branch and tag names, "
           f"environment variable names, secrets, source code")
+    if doc["dream"]["status"] == "written":
+        print(f"  model-written: dream.text = {doc['dream']['text']}")
     if census:
         for path, v in leaves(doc):
             if path.startswith("census") and isinstance(v, str) and path not in ("census.reviewer", "census.model", "census.weights_version"):

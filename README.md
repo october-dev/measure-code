@@ -1,6 +1,6 @@
 # measure-code
 
-A Claude Code skill that measures one git repository **on your own machine** and writes counts only: history, authors (counted, never named), lines by language, tests and test tools, classification, engineering signals, code age, a build probe, logic depth, capacity (mineable commits), and a reviewer census with task mining.
+A Claude Code skill that measures one git repository **on your own machine** and writes counts only: history, authors (counted, never named), lines by language, tests and test tools, classification, engineering signals, code age, a build probe, logic depth, capacity (mineable commits), and a reviewer census with task mining. It ends with a short, clearly labelled **"Why this is special"** pitch that Claude writes after the audit (dream mode).
 
 It is one of four October measurement skills:
 
@@ -28,14 +28,16 @@ python3 ~/.claude/skills/measure-code/scripts/measure_code.py ~/code/my-game \
     --out ./measure-out/game-client --label game-client --mode simple
 ```
 
-Then the full run (the default mode). A full run is `measured` only when every lane ran, including the reviewer census and task mining that Claude writes in the session (see [SKILL.md](SKILL.md)). Otherwise it is `partial`, and `status_reasons` says why, from a fixed list:
+Then the full run (the default mode). A full run is `measured` when every default lane completed, including the reviewer census and task mining that Claude writes in the session (see [SKILL.md](SKILL.md)). It is `partial` only when something actually failed, timed out or was skipped, and `status_reasons` says why, from a fixed list:
 
 ```bash
 python3 ~/.claude/skills/measure-code/scripts/measure_code.py ~/code/my-game \
     --out ./measure-out/game-client --label game-client --tag project:my-game
 ```
 
-Reasons: `simple_mode`, `not_a_git_repository`, `no_commits`, `shallow_clone`, `census_not_run`, `task_mining_skipped`, `build_not_executed`, `build_environment_missing`, `build_timed_out`, `code_age_partial`, `code_age_not_run`.
+Reasons: `simple_mode`, `not_a_git_repository`, `no_commits`, `shallow_clone`, `census_not_run`, `task_mining_skipped`, `build_failed`, `tests_failed`, `build_environment_missing`, `build_timed_out`, `build_unsupported`, `code_age_partial`, `code_age_not_run`.
+
+The build reasons apply only to a build you asked for (`--build discover` or `full`). With the default `--build detect` no build is executed, and that is recorded as info (`status_info: {"build": "not_requested"}`), not as a reason for `partial`. Simple mode is always `estimate`.
 
 Or in Claude Code:
 
@@ -57,6 +59,7 @@ Or in Claude Code:
 | `--verify FILE` | none | re-measure the repo and check an existing measure.json (digests, fingerprints, stable counts) |
 | `--sample-files N` | 400 | simple mode: source files to read |
 | `--force` / `--review` | off | recompute cached stages / print every value |
+| `--no-dream` | off | skip the "Why this is special" pitch |
 
 Output:
 
@@ -65,7 +68,8 @@ measure-out/game-client/
 ├── measure.json       # schema october.measure/v1, kind "code"
 ├── summary_row.json   # one flat row
 ├── summary_row.csv
-├── report.md
+├── report.md          # ends with "Why this is special" once the pitch is added
+├── dream.json         # the pitch, kept for re-runs
 └── .state/            # per-stage cache for resuming; delete before sharing
 ```
 
@@ -88,6 +92,17 @@ See [`examples/`](examples/) for output built from **synthetic** data.
 | task mining: up to 150 grounded ideas, counted per kind | - | required |
 | provenance: head-commit fingerprint, scripts digest, payload digest; `--verify` | yes | yes |
 | full-run recommendation | yes | yes |
+| why this is special: the agent's pitch after the audit (`add_dream.py`), validated and labelled | yes | yes (on by default, `--no-dream` skips) |
+
+## Dream mode: "Why this is special"
+
+Counts miss taste, ambition, complexity and polish. So after the audit, Claude re-reads the report and what it inspected and writes a 4-6 sentence founder-style pitch, for example "a full AAA-style Unity game with richly detailed assets, complete end-to-end levels and a real Steam launch". It is on by default; `--no-dream` (or telling Claude you don't want a pitch) skips it.
+
+The pitch must be grounded only in what the run saw: files, folders, commits, store pages or build pipelines in the repo, and the counts in the report. `scripts/add_dream.py` validates it before inserting it: 4-6 sentences and no more than 160 words, no emails, URLs, handles, paths, file names, tokens or author names from the history, and every number must already appear in the report. It is written to `measure.json` as `dream` and rendered as the last section of `report.md`, labelled as a pitch, so the measured sections stay neutral and credible. See [`examples/starfall-client/`](examples/starfall-client/) for a synthetic one.
+
+```bash
+python3 ~/.claude/skills/measure-code/scripts/add_dream.py draft.txt --out ./measure-out/game-client --repo ~/code/my-game
+```
 
 ## Privacy
 
@@ -103,7 +118,7 @@ See [`examples/`](examples/) for output built from **synthetic** data.
 bash tests/selftest.sh
 ```
 
-It covers full and simple mode, the census and task-mining rules, capacity and strict fix detection, PR and AI-co-author matching, branch selection, multi-root builds with failure attribution, empty repos, folders without git, shallow clones, partial code age, `--verify` and the output boundary, all on throwaway synthetic repos. It passes on Python 3.9 and later.
+It covers full and simple mode, the status rules (a default run without a requested build is `measured`), dream mode (insert, validation, re-runs and `--no-dream`), the census and task-mining rules, capacity and strict fix detection, PR and AI-co-author matching, branch selection, multi-root builds with failure attribution, empty repos, folders without git, shallow clones, partial code age, `--verify` and the output boundary, all on throwaway synthetic repos. It passes on Python 3.9 and later.
 
 ## License
 

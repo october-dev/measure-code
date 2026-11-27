@@ -1,8 +1,8 @@
 # Code measurement: starfall-client
 
-Measured 2026-11-20 with measure-code 0.3.0, full mode. Counts only: no names, paths or messages.
+Measured 2026-11-20 with measure-code 0.4.0, full mode. Counts only: no names, paths or messages.
 
-**Status: partial** (build_not_executed)
+**Status: measured** (every lane ran, including the reviewer census and task mining); info: build not_requested
 
 ## 1. Headline
 
@@ -88,10 +88,10 @@ Authenticity signals: median comment ratio 11.0%; assistant-phrase hits 0; gener
 
 ## 6. Build probe
 
-- level: detect; status **not_run**
+- level: detect; status **not_requested**
 - build systems: none; engine: unity 2021.3.16f1; project roots probed 0 of 0
 - build ok: n/a; tests found in files 1,260, listed by the runner n/a, suite ran n/a; passed n/a, failed n/a
-- discover index n/a; executed runnability n/a; note: detect level runs nothing
+- discover index n/a; executed runnability n/a; note: detect level reads manifests only; no build was requested
 
 ## 7. Code age
 
@@ -158,10 +158,11 @@ Generic task ideas:
 - code_age: complete
 - review: census recorded (the session's AI model read the source)
 - task_mining: done
+- dream: why this is special written by the agent after the audit (not a measurement)
 
 ## Provenance
 
-- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `3f56fa4313fb3f885a8171472a7cbeaf`; payload digest `7e9b99407bd1c9de17ac1f0a2aeeb8ad`
+- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `7b25759288d604ad409b92cbdb81b3c1`; payload digest `b33b14a03a0840510c2628ef210aeb98`
 - A buyer can check these numbers on their own copy: `measure_code.py <repo> --verify measure.json`.
 
 ## Caveats
@@ -171,3 +172,9 @@ Generic task ideas:
 - Functions and nesting come from regexes and indentation, not a parser.
 - AI-assisted counts see only known agent addresses and product names in trailers and accounts; tools that leave neither are invisible.
 - Dates are author dates and can be rewritten by rebases or imports.
+
+## Why this is special
+
+_Founder-style pitch written by the AI agent after the audit, from what it inspected in this run. It is not a measurement and changes no count above._
+
+This is a full co-op action game client, not a prototype: 14 people put 9,400 commits into it between 2019 and 2024. Under the hood it runs a deterministic simulation with procedural levels and networked play, which is the hard kind of game code to get right. The team cared about craft, with 1,260 test cases, 37 release tags and 1,034 merged pull requests behind it. All 165,900 lines were written before 2025, so this is years of human game-making, not a weekend of generated code.
