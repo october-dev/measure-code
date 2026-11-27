@@ -5,9 +5,9 @@ description: Measure one git repository privately on this machine and write coun
 
 # measure-code
 
-Measures one git repository and writes a privacy-preserving summary. The script makes **no network calls** unless the user opts into `--install`, and it **uploads nothing**. The output holds numbers, fixed vocabulary and one-way fingerprints, plus the label the user picks. Every string in the output must sit in a declared field. Anything else, and any email address, absolute path or history author name, stops the run before a file is written.
+Measures one git repository and writes a privacy-preserving summary. The script makes **no network calls** unless the user opts into `--install`, and it **uploads nothing**. The output holds numbers, fixed vocabulary and one-way fingerprints, plus the label the user picks. Every string in the output must sit in a declared field. Anything else, and any email address, absolute path or history author name, stops the run before a file is written. `<skill-dir>` below is the folder holding this SKILL.md.
 
-**Disclosure.** The reviewer census and task mining (step 5) are done by you, the AI model of this session, reading the repository's source and history. That means the source is shown to this session's model provider, under the user's own account. Say so to the user before step 5. The script itself never sends anything anywhere.
+**Disclosure.** The reviewer census and task mining (step 5) are done by you, the agent: your agent's model reads the repository's source and history. That means the source is shown to that model's provider, under the user's own account. Say so to the user before step 5. The script itself never sends anything anywhere.
 
 ## Two modes
 
