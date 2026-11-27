@@ -125,7 +125,7 @@ import csv, json, sys, pathlib
 w = pathlib.Path(sys.argv[1])
 load = lambda p: json.loads((w / p / "measure.json").read_text())
 d = load("full")
-assert d["schema"] == "october.measure/v1" and d["kind"] == "code" and d["mode"] == "full" and d["tool_version"] == "0.4.0"
+assert d["schema"] == "october.measure/v1" and d["kind"] == "code" and d["mode"] == "full" and d["tool_version"] == "0.5.0"
 g = d["git"]
 assert g["commits"] == 9 and g["authors_human"] == 4 and g["authors_bot"] == 1, g
 assert g["pre_cutoff_commits"] == 2 and g["history_complete"] is True, g
@@ -290,4 +290,209 @@ assert json.loads((w / "declined/dream.json").read_text())["status"] == "skipped
 assert load("full")["dream"]["status"] == "pending" and "Why this is special" not in (w / "full/report.md").read_text()
 print("selftest: status rules and dream mode OK")
 EOF
+# v0.5: people by year with identity merging, ticket references, the pre-ChatGPT cutoff, labels, restriction flags.
+P="$WORK/people"; mkdir -p "$P/Plugins/ThirdParty/zqlib" "$P/Content" "$P/Platforms/PS5" && cd "$P" && git init -q -b main
+printf 'a = 1\n' > a.py; printf 'K=1\n' > .env; printf 'x' > Content/Hero.uasset; printf 'x' > Content/Level.umap
+printf 'int f();\n' > Plugins/ThirdParty/zqlib/lib.h; printf 'x\n' > Platforms/PS5/cfg.ini
+commit_as "2021-05-03T10:00:00Z" "Jane Q Dev" "jane@corp.example" "PRJ-7 initial"
+printf 'a = 2\n' > a.py; commit_as "2021-05-20T10:00:00Z" "jane q dev" "jane.home@else.example" "fix crash PRJ-8"
+printf 'a = 3\n' > a.py; commit_as "2022-03-01T10:00:00Z" "jqd" "991+jqdev@users.noreply.github.com" "tidy (refs #31)"
+printf 'a = 4\n' > a.py; commit_as "2023-02-01T10:00:00Z" "Jane Q Dev" "991+jqdev@users.noreply.github.com" "fix load bug UTF-8 SHA-256 PRJ-8"
+printf 'a = 5\n' > a.py; commit_as "2024-07-01T10:00:00Z" "Other Person" "other@corp.example" "add feature"
+printf 'a = 6\n' > a.py; commit_as "2024-07-02T10:00:00Z" "dependabot[bot]" "bot@example.com" "bump PRJ-99"
+cd "$WORK"
+"$PY" "$M" "$P" --out "$WORK/o-people" --mode simple --label people-repo >/dev/null 2>&1
+"$PY" "$M" "$P" --out "$WORK/o-people-early" --mode simple --cutoff-early 2021-06-01 --link-salt s3cret \
+  --flag client_owned --flag player_personal_data=no >/dev/null 2>&1
+"$PY" "$M" "$P" --out "$WORK/o-people-full" --label people-repo --blame-seconds 0 --no-dream >/dev/null 2>&1
+"$PY" - "$WORK" "$M" <<'PYEOF'
+import json, sys, pathlib, hashlib, importlib.util
+w = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("m", sys.argv[2]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = json.loads((w / "o-people/measure.json").read_text())
+pe = d["people"]
+# Jane's three identities (two emails share a normalised name, the noreply login links the third) are one person
+assert pe["merged_people"] == 2 and pe["identities"] == 5, pe
+assert pe["by_year"] == {"2021": {"unique_people": 1, "active_person_months": 1}, "2022": {"unique_people": 1, "active_person_months": 1},
+                         "2023": {"unique_people": 1, "active_person_months": 1}, "2024": {"unique_people": 1, "active_person_months": 1}}, pe["by_year"]
+jane = max(pe["persons"], key=lambda p: p["commits"])
+assert jane["commits"] == 4 and jane["months"] == ["2021-05", "2022-03", "2023-02"] and len(jane["tokens"]) == 4, jane
+assert m.link_hash("email", "jane@corp.example") in jane["tokens"] and m.link_hash("gh", "jqdev") in jane["tokens"]
+assert m.link_hash("x", "y") == hashlib.sha256(b"|x|y").hexdigest()[:16]
+tr = d["ticket_refs"]
+assert tr["commits_with_ref"] == 5 and tr["fix_commits_with_ref"] == 2, tr        # bot commits count for refs, merges do not
+assert tr["by_pattern"]["project_key"] == {"commits": 4, "distinct_keys": 3}, tr["by_pattern"]   # UTF-8 and SHA-256 are not keys
+assert tr["by_pattern"]["hash_number"] == {"commits": 1, "distinct_keys": 1}
+assert m.link_hash("ticket", "PRJ-8") in tr["key_hashes"] and m.link_hash("ticket", "#31") in tr["key_hashes"]
+assert m.link_hash("ticket", "UTF-8") not in tr["key_hashes"] and len(tr["key_hashes"]) == 4
+g, c = d["git"], d["cutoffs"]
+assert g["pre_chatgpt_commits"] == 3 and g["pre_chatgpt_share"] == 0.5 and d["cutoff_early"] == "2022-11-30", g
+assert c["pre_chatgpt"] == {"date": "2022-11-30", "count": 3, "share": 0.5, "label": "verified", "unit": "commits"}, c
+assert c["pre_2025"]["count"] == 6 and c["pre_2025"]["date"] == "2025-01-01"
+r = d["restrictions"]["flags"]
+assert d["restrictions"]["ownership"] == "own" and r["client_owned"]["value"] is None and r["client_owned"]["label"] == "unknown"
+assert r["secrets"]["value"] is True and r["secrets"]["count"] == 1 and r["secrets"]["label"] == "verified", r["secrets"]
+assert r["platform_nda"]["value"] is True and r["third_party_middleware"]["value"] is True, r
+ec = d["engine_content"]
+assert ec["files_by_type"]["uasset"] == 1 and ec["files_by_type"]["umap"] == 1, ec
+assert ec["blueprints"] is None and ec["status"] == "not_run" and ec["label"] == "unknown", ec   # simple mode: counter not run
+lb = d["labels"]
+assert lb["tree.code_lines_total"]["label"] == "estimated" and lb["tree.code_lines_total"]["method"]
+assert lb["git.commits"]["label"] == "verified" and lb["engine_content.blueprints"]["label"] == "unknown"
+assert d["own_code"]["own_loc"] is None and d["own_code"]["label"] == "unknown"
+assert all(v["label"] in m.LABELS_VOCAB for v in lb.values())
+assert all(v.get("method") for v in lb.values() if v["label"] == "estimated"), "estimated needs a method"
+e = json.loads((w / "o-people-early/measure.json").read_text())
+assert e["git"]["pre_chatgpt_commits"] == 2 and e["cutoffs"]["pre_chatgpt"]["date"] == "2021-06-01"
+assert e["people"]["link_salt_used"] and m.link_hash("email", "jane@corp.example") not in json.dumps(e), "the salt changes every key"
+assert m.link_hash("ticket", "PRJ-8", "s3cret") in e["ticket_refs"]["key_hashes"]
+er = e["restrictions"]
+assert er["ownership"] == "client_owned" and er["flags"]["client_owned"] == {"value": True, "label": "self_reported", "method": "stated by the seller"}
+assert er["flags"]["player_personal_data"]["value"] is False and er["flags"]["player_personal_data"]["label"] == "self_reported"
+f = json.loads((w / "o-people-full/measure.json").read_text())
+assert f["labels"]["tree.code_lines_total"]["label"] == "verified" and f["people"]["merged_people"] == 2
+rep = (w / "o-people-full/report.md").read_text()
+assert "## 11. People by year" in rep and "pre-ChatGPT" in rep and "| platform nda | yes" in rep, rep
+row = (w / "o-people-full/summary_row.csv").read_text()
+assert "pre_chatgpt_share" in row and "people_merged" in row and "commits_with_ticket_ref" in row
+for o in ("o-people", "o-people-early", "o-people-full"):
+    text = (w / o / "measure.json").read_text() + (w / o / "report.md").read_text()
+    for leak in ("Jane", "jane", "jqdev", "corp.example", "PRJ", "zqlib", "Other Person", "Platforms"):
+        assert leak not in text, (o, leak)
+# shallow and plain folders: unknown, never zero
+p = json.loads((w / "o-plain/measure.json").read_text())
+assert p["people"]["merged_people"] is None and p["people"]["label"] == "unknown" and p["cutoffs"]["pre_chatgpt"]["count"] is None
+assert p["labels"]["git.commits"]["label"] == "unknown"
+em = json.loads((w / "o-empty/measure.json").read_text())
+assert em["people"]["merged_people"] == 0 and em["ticket_refs"]["commits_with_ref"] == 0
+sh = json.loads((w / "o-shallow/measure.json").read_text())
+assert sh["people"]["merged_people"] is None and sh["git"]["pre_chatgpt_commits"] is None
+print("selftest: people, tickets, cutoffs, labels and restrictions OK")
+PYEOF
+"$PY" "$M" "$P" --verify "$WORK/o-people-full/measure.json" >/dev/null
+if "$PY" "$M" "$P" --out "$WORK/o-badflag" --mode simple --flag nonsense >/dev/null 2>&1; then echo "unknown flag accepted"; exit 1; fi
+# Own code (section 8 rules), the vendored Blueprint counter on synthetic packages, settling, fresh uploads, Perforce.
+U="$WORK/unreal"; mkdir -p "$U" && cd "$U" && git init -q -b main
+"$PY" - "$U" <<'PYEOF'
+import struct, pathlib, sys
+u = pathlib.Path(sys.argv[1])
+def fstr(s):
+    b = s.encode("latin-1") + b"\0"
+    return struct.pack("<i", len(b)) + b
+def package(names, nodes, cooked=False):
+    head = struct.pack("<Iiiii", 0x9E2A83C1, -7, 864, 522, 0) + struct.pack("<ii", 0, 0) + fstr("None")
+    head += struct.pack("<I", 0x80000000 if cooked else 0)
+    offset = len(head) + 8 + 16
+    table = b"".join(fstr(n) + b"\0\0\0\0" for n in names)
+    body = struct.pack("<iiii", names.index("NodeGuid"), 0, names.index("StructProperty"), 0) * nodes if "NodeGuid" in names else b""
+    return head + struct.pack("<ii", len(names), offset) + b"\0" * 16 + table + body + b"\0" * 64
+def w(rel, data):
+    p = u / rel; p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data) if isinstance(data, bytes) else p.write_text(data)
+bp = ["Blueprint", "K2Node_CallFunction", "NodeGuid", "StructProperty", "EdGraph"]
+w("Game.uproject", '{"FileVersion": 3}')
+w("Content/Blueprints/BP_Hero.uasset", package(bp + ["HeroThing"], 3))
+w("Content/Blueprints/BP_Copy.uasset", package(bp + ["HeroThing"], 3))          # same bytes: counted once
+w("Content/Blueprints/Big.uasset", "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 9\n")
+w("Content/Blueprints/Tex.uasset", package(["Texture2D", "StructProperty", "PixelFormat"], 0))
+w("Content/StarterContent/BP_Door.uasset", package(bp + ["DoorThing"], 2))      # template content
+w("Content/Maps/Main.umap", package(["LevelScriptBlueprint", "K2Node_Event", "NodeGuid", "StructProperty", "World"], 4))
+w("Content/AI/BT_Main.uasset", package(["BehaviorTreeGraphNode_Root", "NodeGuid", "StructProperty", "BehaviorTree"], 2))
+lines = lambda n, tag: "".join(f"int {tag}_{i} = {i};\n\n" for i in range(n))
+w("Source/Game/Player.cpp", "// Fill out your copyright notice in the Description page of Project Settings.\n" + lines(10, "p"))
+w("Source/Game/Player.h", lines(4, "h"))
+w("Source/Game/Copy.cpp", "// Fill out your copyright notice in the Description page of Project Settings.\n" + lines(10, "p"))
+w("Source/Game/Zq1.cpp", "// Copyright 2020 Zq Studio. All rights reserved.\n" + lines(5, "a"))
+w("Source/Game/Zq2.cpp", "// Copyright (c) 2021 Zq Studio\n" + lines(5, "b"))
+w("Source/Game/Acme.cpp", "// Copyright 2019 Acme Middleware Ltd. All Rights Reserved.\n" + lines(7, "c"))
+w("Source/Game/Epic.cpp", "// Copyright Epic Games, Inc. All Rights Reserved.\n" + lines(6, "e"))
+w("Source/Game/Player.generated.h", lines(8, "g"))
+w("Source/Game/Game.Build.cs", lines(3, "r")); w("Source/Game.Target.cs", lines(3, "t"))
+w("Source/Game/Android/Glue.java", lines(2, "j"))
+w("Source/ThirdParty/zqlib/lib.cpp", lines(9, "v"))
+w("Intermediate/Build/x.cpp", lines(5, "x"))
+w("Plugins/ZqTool/ZqTool.uplugin", '{"CreatedBy": "Zq Studio"}'); w("Plugins/ZqTool/Source/Tool.cpp", lines(6, "zt"))
+w("Plugins/Qxplug/Qxplug.uplugin", '{"CreatedBy": "Some Vendor GmbH"}'); w("Plugins/Qxplug/Source/Qxplug.cpp", lines(11, "vd"))
+w("settle.json.txt", "x")
+PYEOF
+rm -f settle.json.txt
+commit_as "2020-02-01T10:00:00Z" "Zq Dev" "zq@studio.example" "import project"
+commit_as "2020-02-02T10:00:00Z" "Zq Dev" "zq@studio.example" "touch" 2>/dev/null || true
+printf '{"plugins": {"ZqTool": "own"}, "content": {"Blueprints": "own", "Maps": "own", "AI": "bought"}}' > "$WORK/settle.json"
+cd "$WORK"
+"$PY" "$M" "$U" --out "$WORK/o-u" --label game-x --blame-seconds 0 --no-dream >/dev/null 2>&1
+"$PY" "$M" "$U" --out "$WORK/o-u-studio" --label game-x --blame-seconds 0 --no-dream --studio-name "Zq Studio" >/dev/null 2>&1
+"$PY" "$M" "$U" --out "$WORK/o-u-settled" --label game-x --blame-seconds 0 --no-dream --settle "$WORK/settle.json" \
+  --project-type client_game >/dev/null 2>&1
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/p4" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"changes -s submitted //depot/main/..."*) for c in 1 2 3; do printf '... change %s\n... time %s\n... user u%s\n' $c $((1500000000 + c * 86400)) $c; done ;;
+  *"changes -s submitted //depot/dev/..."*) for c in 3 4; do printf '... change %s\n... time %s\n... user u%s\n' $c $((1500000000 + c * 86400)) $c; done ;;
+  *users*) printf '... User a\n... User b\n... User c\n' ;;
+esac
+SH
+chmod +x "$WORK/bin/p4"
+PATH="$WORK/bin:$PATH" "$PY" "$M" "$U" --out "$WORK/o-u-p4" --mode simple --p4-path //depot/main/... --p4-path //depot/dev/... >/dev/null 2>&1
+"$PY" - "$WORK" "$M" <<'PYEOF'
+import json, sys, pathlib, importlib.util
+w = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("m", sys.argv[2]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# the TOTAL line, thousands separators included
+t = m.parse_bp_line("TOTAL: Behavior Tree graphs 3, Behavior Tree nodes 1,204, blueprint nodes 12,345, blueprints 1,002, lfs pointer 2")
+assert t == {"behavior_tree_graphs": 3, "behavior_tree_nodes": 1204, "blueprint_nodes": 12345, "blueprints": 1002, "lfs_pointer": 2}, t
+assert m.bp_summary(t)["other_graphs"] == {"behavior_tree": {"graphs": 3, "nodes": 1204}} and m.bp_summary(t)["cooked"] == 0
+assert m.parse_bp_line("TOTAL: ") == {}
+assert m.is_lfs_pointer(b"version https://git-lfs.github.com/spec/v1\n") and not m.is_lfs_pointer(b"\xc1\x83\x2a\x9e")
+d = json.loads((w / "o-u/measure.json").read_text())
+ec = d["engine_content"]
+assert ec["status"] == "counted" and ec["blueprints"] == 2 and ec["blueprint_nodes"] == 5, ec      # the copy counted once
+assert ec["level_blueprints"] == 1 and ec["level_blueprint_nodes"] == 4 and ec["duplicate_blueprints"] == 1, ec
+assert ec["lfs_pointer"] == 1 and ec["other_graphs"] == {"behavior_tree": {"graphs": 1, "nodes": 2}}, ec
+assert ec["label"] == "estimated" and ec["partial"] and ec["partial_reason"] == "counts incomplete", ec   # an LFS pointer
+assert ec["own"]["blueprints"] == 1 and ec["own"]["blueprint_nodes"] == 3 and ec["excluded"]["blueprints"] == 1, ec  # StarterContent
+oc = d["own_code"]
+ex = oc["excluded"]
+assert oc["unreal_projects"] == 1 and oc["lfs_pointer_assets"] == 1
+assert ex["build_rules"] == {"files": 2, "loc": 6} and ex["generated"]["files"] == 1 and ex["duplicate_content"] == {"files": 1, "loc": 11}, ex
+assert ex["foreign_copyright"] == {"files": 1, "loc": 8} and ex["engine_template_code"]["files"] == 1, ex
+assert ex["vendored"]["loc"] == 9 and ex["build_output_or_cache"]["loc"] == 5 and ex["unsettled_plugin"]["files"] == 2, ex
+# own: Player.cpp 11 (UE default notice kept), Player.h 4, Zq1/Zq2 6 each (presumed studio holder), Glue.java 2
+assert oc["own_loc"] == 29 and oc["own_files"] == 5, oc
+assert oc["label"] == "estimated" and "presumed" in oc["method"] and oc["unsettled"]["plugins"] == 2, oc
+assert oc["content_folders"] == {"total": 4, "own": 0, "template": 1, "bought": 0, "unsettled": 3}, oc["content_folders"]
+assert oc["unsettled"]["non_cpp_code_in_unreal_loc"] == 2
+st = json.loads((w / "o-u-studio/measure.json").read_text())["own_code"]
+assert st["own_loc"] == 35 and st["excluded"]["third_party_plugin"] == {"files": 1, "loc": 11} and "unsettled_plugin" not in st["excluded"], st
+se = json.loads((w / "o-u-settled/measure.json").read_text())
+assert se["own_code"]["content_folders"] == {"total": 4, "own": 2, "template": 1, "bought": 1, "unsettled": 0}, se["own_code"]["content_folders"]
+assert se["own_code"]["excluded"]["unsettled_plugin"]["files"] == 1 and se["own_code"]["own_loc"] == 35
+ct = se["code_table"]
+assert ct["type"] == "client_game" and ct["type_label"] == "self_reported" and ct["vcs"] == "git" and ct["own_loc"] == 35, ct
+assert ct["blueprints"] == 2 and ct["blueprint_nodes"] == 5 and ct["primary_language"] == "C++" and ct["contributors_people"] == 1, ct
+assert ct["pct_merged"] is None and se["labels"]["code_table.pct_merged"]["label"] == "unknown"
+assert set(ct) >= {"project", "engine", "commits", "prs_merged", "source_files", "test_files", "first_commit", "last_commit",
+                   "assets_own", "assets_excluded"}
+assert ct["assets_excluded"] >= 2 and ct["assets_own"] >= 3, ct      # StarterContent and the bought AI folder are excluded
+# fresh upload: two commits a day apart
+assert d["git"]["fresh_upload"] is True and d["status_info"].get("history") == "fresh_upload", d["status_info"]
+rep = (w / "o-u/report.md").read_text()
+assert "## 12. Own code" in rep and "Fresh upload" in rep and "counts incomplete" in rep and "| foreign copyright | 1 | 8 |" in rep, rep
+# the settling list names folders, plugins and files, privately; measure.json and report.md never do
+pv = (w / "o-u/.private/settling.md").read_text()
+assert "Acme" in pv and "Content/StarterContent" in pv and "Plugins/Qxplug" in pv and "Some Vendor GmbH" in pv and "PRIVATE" in pv
+for o in ("o-u", "o-u-studio", "o-u-settled", "o-u-p4"):
+    text = (w / o / "measure.json").read_text() + (w / o / "report.md").read_text()
+    for leak in ("Acme", "Qxplug", "ZqTool", "StarterContent", "Zq Studio", "BP_Hero", "Glue", "Player", "Blueprints/"):
+        assert leak not in text, (o, leak)
+pf = json.loads((w / "o-u-p4/measure.json").read_text())
+p4 = pf["perforce"]
+assert p4["status"] == "counted" and p4["submitted_changes"] == 4 and p4["paths"] == 2, p4   # change 3 sits in both streams
+assert p4["submitting_accounts"] == 4 and p4["server_users"] == 3 and p4["first_change"] == "2017-07-15", p4
+assert pf["code_table"]["vcs"] == "git+perforce"
+assert json.loads((w / "o-people/measure.json").read_text())["perforce"]["status"] == "not_requested"
+print("selftest: own code, Blueprints, settling, fresh upload and Perforce OK")
+PYEOF
+"$PY" "$M" "$U" --verify "$WORK/o-u/measure.json" >/dev/null
 echo "selftest: passed"

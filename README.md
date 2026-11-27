@@ -1,6 +1,6 @@
 # measure-code
 
-An agent skill for Claude Code, Codex, Grok, Hermes and other coding agents that measures one git repository **on your own machine** and writes counts only: history, authors (counted, never named), lines by language, tests and test tools, classification, engineering signals, code age, a build probe, logic depth, capacity (mineable commits), and a reviewer census with task mining. It ends with a short, clearly labelled **"Why this is special"** pitch that the agent writes after the audit (dream mode).
+An agent skill for Claude Code, Codex, Grok, Hermes and other coding agents that measures one git repository **on your own machine** and writes counts only: history, authors (counted, never named), lines by language, tests and test tools, classification, engineering signals, code age, a build probe, logic depth, capacity (mineable commits), a reviewer census with task mining, people by year (identities merged and hashed), commits naming ticket keys, pre-2025 and pre-ChatGPT shares, own lines of code under buyer rules, Unreal Blueprints and Blueprint nodes, optional Perforce history, the buyer's per-repo code table, labels on every number and restriction flags. It ends with a short, clearly labelled **"Why this is special"** pitch that the agent writes after the audit (dream mode).
 
 It is one of four October measurement skills:
 
@@ -32,14 +32,7 @@ The commands below use `$SKILL` for the folder you cloned into, for example `SKI
 
 ## Use
 
-**Start with simple mode.** It reads history metadata and a sample of files, takes seconds to minutes, and tells you whether a full run is worth it. Every simple-mode figure is an estimate (`status: estimate`):
-
-```bash
-python3 $SKILL/scripts/measure_code.py ~/code/my-game \
-    --out ./measure-out/game-client --label game-client --mode simple
-```
-
-Then the full run (the default mode). A full run is `measured` when every default lane completed, including the reviewer census and task mining that your agent's model writes in the session (see [SKILL.md](SKILL.md)). It is `partial` only when something actually failed, timed out or was skipped, and `status_reasons` says why, from a fixed list:
+Run the full measurement (the default mode). A full run is `measured` when every default lane completed, including the reviewer census and task mining that your agent's model writes in the session (see [SKILL.md](SKILL.md)). It is `partial` only when something actually failed, timed out or was skipped, and `status_reasons` says why, from a fixed list:
 
 ```bash
 python3 $SKILL/scripts/measure_code.py ~/code/my-game \
@@ -52,15 +45,25 @@ The build reasons apply only to a build you asked for (`--build discover` or `fu
 
 Or in your coding agent (Claude Code, Codex, Grok, Hermes ...):
 
-> Use measure-code on ~/code/my-game: simple mode first, then a full run if it's worth it
+> Use measure-code on ~/code/my-game
+
+**Simple mode (optional):** a fast sampled pass, used only when asked to do a quick look. It reads history metadata and a sample of files, and every figure is an estimate (`status: estimate`). Add `--mode simple`; the agent does not pick it unless you ask.
 
 | flag | default | meaning |
 |---|---|---|
-| `--mode simple\|full` | full | simple = fast, sampled, estimates only, no build/blame/census; full = every lane |
+| `--mode simple\|full` | full | full = every lane (default); simple (optional) = fast sampled quick look, estimates only, only when asked |
 | `--out DIR` | required | output folder, outside the repo |
 | `--label NAME` | folder name | the only name written to the output |
 | `--tag K:V` | none | cross-linking tag for master-valuate (repeatable) |
 | `--cutoff DATE` | 2025-01-01 | date for pre-cutoff shares. The default is there because buyers price work written before 2025 |
+| `--cutoff-early DATE` | 2022-11-30 | second cutoff for pre-ChatGPT counts and shares |
+| `--link-salt S` | empty | secret mixed into hashed person and ticket keys; use the same value for every run of one studio |
+| `--flag NAME[=no]` | none | self-reported restriction flag: client_owned, platform_nda, third_party_middleware, player_personal_data, staff_personal_data, secrets |
+| `--ownership` | own | own, client_owned or unclear |
+| `--studio-name NAME` | none | the studio's name or a former name (repeatable): plugins and copyright headers naming it count as own code |
+| `--settle FILE` | none | the studio's answers to the private settling list (Content folders, plugins, files) |
+| `--p4-path PATH` | none | also count Perforce history read-only for this depot path or stream (repeatable; contacts the Perforce server) |
+| `--project-type` | estimated | own_game, client_game, prototype, tool or engine for the code table |
 | `--ref auto\|head` | auto | auto measures history on the deepest branch when it is clearly deeper than HEAD; head = HEAD only |
 | `--all-refs` | off | the union of every branch and tag |
 | `--build detect\|discover\|full` | detect | discover builds each project root and lists tests; full also runs the suites. Both **execute repo code** |
@@ -81,6 +84,7 @@ measure-out/game-client/
 ├── summary_row.csv
 ├── report.md          # ends with "Why this is special" once the pitch is added
 ├── dream.json         # the pitch, kept for re-runs
+├── .private/          # settling list with folder, plugin and file names: for the studio only, never share
 └── .state/            # per-stage cache for resuming; delete before sharing
 ```
 
@@ -101,6 +105,12 @@ See [`examples/`](examples/) for output built from **synthetic** data.
 | build probe: multi-root, failure attribution (environment vs repo), tests found / listed / run | - | detect (default), discover, full; `--install` opt-in |
 | reviewer census: nine work categories, weighted logic depth, themes (`add_census.py`) | - | required |
 | task mining: up to 150 grounded ideas, counted per kind | - | required |
+| people by year: merged identities (email, GitHub noreply login, normalised name), unique people and active person-months, hashed person keys | yes | yes |
+| ticket references: commits naming `ABC-123` or `#123`, per pattern, hashed keys for bug → fix linking | yes | yes |
+| labels on every material number, pre-2025 and pre-ChatGPT cutoffs, restriction flags, engine content counts | yes | yes |
+| own code: buyer exclusion rules, each file content once, a private settling list for the studio | - | yes |
+| Unreal Blueprints and nodes with the vendored `count_blueprints.py`, own vs excluded, LFS and cooked flags | - | yes |
+| Perforce history (`--p4-path`), fresh-upload check, the buyer's per-repo code table | yes | yes |
 | provenance: head-commit fingerprint, scripts digest, payload digest; `--verify` | yes | yes |
 | full-run recommendation | yes | yes |
 | why this is special: the agent's pitch after the audit (`add_dream.py`), validated and labelled | yes | yes (on by default, `--no-dream` skips) |
@@ -129,7 +139,7 @@ python3 $SKILL/scripts/add_dream.py draft.txt --out ./measure-out/game-client --
 bash tests/selftest.sh
 ```
 
-It covers full and simple mode, the status rules (a default run without a requested build is `measured`), dream mode (insert, validation, re-runs and `--no-dream`), the census and task-mining rules, capacity and strict fix detection, PR and AI-co-author matching, branch selection, multi-root builds with failure attribution, empty repos, folders without git, shallow clones, partial code age, `--verify` and the output boundary, all on throwaway synthetic repos. It passes on Python 3.9 and later.
+It covers full and simple mode, people by year with identity merging and the link salt, ticket references, both cutoffs, labels, restriction flags, own-code exclusions, the Blueprint counter on synthetic Unreal packages (TOTAL-line parsing, duplicates, LFS pointers, own vs template content), settling, the fresh-upload check, Perforce through a stub `p4`, the status rules (a default run without a requested build is `measured`), dream mode (insert, validation, re-runs and `--no-dream`), the census and task-mining rules, capacity and strict fix detection, PR and AI-co-author matching, branch selection, multi-root builds with failure attribution, empty repos, folders without git, shallow clones, partial code age, `--verify` and the output boundary, all on throwaway synthetic repos. It passes on Python 3.9 and later.
 
 ## License
 

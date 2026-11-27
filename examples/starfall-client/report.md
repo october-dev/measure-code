@@ -1,6 +1,6 @@
 # Code measurement: starfall-client
 
-Measured 2026-11-20 with measure-code 0.4.0, full mode. Counts only: no names, paths or messages.
+Measured 2026-11-20 with measure-code 0.5.0, full mode. Counts only: no names, paths or messages.
 
 **Status: measured** (every lane ran, including the reviewer census and task mining); info: build not_requested
 
@@ -10,6 +10,7 @@ Measured 2026-11-20 with measure-code 0.4.0, full mode. Counts only: no names, p
 - 165,900 lines of code (comments and blank lines excluded; 189,126 non-blank lines with comments) in 1,036 source files; main language C#; class game
 - Tests: 140 files, 1,260 test cases declared, test/source line ratio 0.12; test tools nunit, unity-test-framework
 - 100.0% of commits are dated before 2025-01-01; 0.0% of today's code lines were written after it
+- 83.4% (7,843 commits) are dated before 2022-11-30 (pre-ChatGPT)
 - Logic depth **4/6** (from the reviewer census; deterministic band 3/6)
 - Capacity: 2,476 mineable commits; 784 commits change source and tests together; 4 mined task ideas
 
@@ -150,6 +151,52 @@ Generic task ideas:
 - repo evolution: Move save data from a flat binary blob to a versioned schema with migrations
 - long horizon: Profile a slow scene load, find the asset that blocks the main thread, and make it stream
 
+## 11. People by year, ticket references and restrictions
+
+People (merged identities, label estimated): 14 from 17 author identities. Only hashed keys are kept.
+
+| year | unique people | active person-months |
+|---|---|---|
+| 2019 | 4 | 25 |
+| 2020 | 4 | 43 |
+| 2021 | 5 | 31 |
+| 2022 | 7 | 53 |
+| 2023 | 10 | 77 |
+| 2024 | 5 | 35 |
+
+Commits naming a ticket (label verified): 3,572 (38.0%); of them fixes 1,464. Project keys (ABC-123): 3,384 commits, 1,400 keys; #123 references: 188 commits, 117 keys. Hashed keys let master-valuate link resolved bugs to fixes.
+
+Engine content tracked: uasset 0, umap 0, unity 62, prefab 932, tscn 0.
+
+Ownership: own (default (the seller owns its data)). Restriction flags (recorded, not ruled on):
+
+| flag | value | label | basis |
+|---|---|---|---|
+| client owned | unknown | unknown | ownership is a contract question; set --ownership or --flag client_owned |
+| platform nda | no | estimated | no console-platform folder or file names tracked |
+| third party middleware | yes (2) | verified | third-party, plugin or middleware paths tracked |
+| player personal data | unknown | unknown | code is not read for player records |
+| staff personal data | unknown | unknown | author identities are hashed, never written |
+| secrets | no | estimated | no credential-like file names tracked; file contents are not scanned |
+
+## 12. Own code, Blueprints and the code table
+
+Own lines of code (label verified): **183,453** in 1,015 files (non-blank lines including comments, each distinct file once); excluded 78,669 lines:
+
+| excluded because | files | lines |
+|---|---|---|
+| asset store package | 291 | 72,996 |
+| generated | 12 | 3,782 |
+| duplicate content | 9 | 1,891 |
+
+Blueprints: not applicable (no Unreal project in this repository).
+
+Code table (block E):
+
+| project | type | engine | vcs | own loc | primary language | blueprints | blueprint nodes | commits | contributors people | prs merged | pct merged | source files | test files | first / last commit | assets own / excluded |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| starfall-client | own_game | unity 2021.3.16f1 | git | 183,453 | C# | n/a | n/a | 9,400 | 14 | 1,034 | n/a | 1,036 | 140 | 2019-03-11 / 2024-08-30 | 4,351 / 828 |
+
 ## Lanes
 
 - history: full census with lines changed
@@ -162,12 +209,12 @@ Generic task ideas:
 
 ## Provenance
 
-- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `7b25759288d604ad409b92cbdb81b3c1`; payload digest `b33b14a03a0840510c2628ef210aeb98`
+- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `eb1ef42e0b72d3dc58f3387583034795`; payload digest `2dbd31347b3276ec8fb03c450ebe45d2`
 - A buyer can check these numbers on their own copy: `measure_code.py <repo> --verify measure.json`.
 
 ## Caveats
 
-- Authors are keyed on email; one person with several emails counts more than once.
+- `authors_human` is keyed on email; `people.merged_people` merges emails, GitHub noreply logins and normalised names, so it can also merge two different people who share a name.
 - Commit kinds come from message keywords plus the diff shape (a fix must delete lines); they are signals, not verified labels.
 - Functions and nesting come from regexes and indentation, not a parser.
 - AI-assisted counts see only known agent addresses and product names in trailers and accounts; tools that leave neither are invisible.

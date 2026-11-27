@@ -55,7 +55,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 TOOL = "measure-code"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SCHEMA = "october.measure/v1"
 SKETCH_K = 256
 TASK_KINDS = ("bugfix", "feature", "restructure", "exploratory")
@@ -1395,6 +1395,673 @@ def stage_blame(repo: Path, cutoff: str, budget: int) -> dict:
 
 
 # --------------------------------------------------------------------------
+# stage: people by year, ticket references, early cutoff (one extra pass over the history)
+# --------------------------------------------------------------------------
+
+LABELS_VOCAB = ("verified", "estimated", "self_reported", "unknown", "not_applicable")
+RESTRICTION_FLAGS = ("client_owned", "platform_nda", "third_party_middleware", "player_personal_data",
+                     "staff_personal_data", "secrets")
+GH_NOREPLY_RX = re.compile(r"^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$", re.I)
+PROJECT_KEY_RX = re.compile(r"(?<![A-Za-z0-9_-])([A-Z][A-Z0-9]+-\d+)(?![A-Za-z0-9_])")
+HASH_NUMBER_RX = re.compile(r"(?<![\w&/#])#(\d+)\b")
+NOT_TICKET_PREFIXES = {"UTF", "SHA", "ISO", "RFC", "CVE", "MD", "AES", "RSA", "TLS", "SSL", "HTTP", "GPT", "PEP", "ES",
+                       "ECMA", "WIN", "X86", "X64", "ARM", "IPV", "CP", "LATIN", "COVID", "DDR", "PCI", "USB", "HDMI"}
+GENERIC_NAMES = {"root", "admin", "administrator", "user", "unknown", "ubuntu", "developer", "github", "gitlab", "your name",
+                 "runner", "build", "jenkins", "local", "none", "test", "default"}
+KEY_HASH_CAP = 50_000
+
+
+def link_hash(kind: str, value: str, salt: str = "") -> str:
+    """One-way key shared with measure-data and master-valuate, so the same email, login, name or ticket key
+    links across repositories and runs without being written down. A studio can pass --link-salt to every run."""
+    return hashlib.sha256(f"{salt}|{kind}|{value}".encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def norm_name(name: str) -> str | None:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+    if len(s) < 4 or s in GENERIC_NAMES:
+        return None
+    return s
+
+
+def identity_tokens(name: str, email: str, salt: str) -> list:
+    out = []
+    e = (email or "").strip().lower()
+    m = GH_NOREPLY_RX.match(e)
+    if m:
+        out.append(link_hash("gh", m.group(1).lower(), salt))
+    elif e and "@" in e and "noreply" not in e:
+        out.append(link_hash("email", e, salt))
+    n = norm_name(name)
+    if n:
+        out.append(link_hash("name", n, salt))
+    return out
+
+
+def stage_people(repo: Path, rev: list, pathspec: list, cutoff: str, cutoff_early: str, salt: str) -> dict:
+    """Unique people per year with identities merged (same email, a GitHub noreply login, or the same normalised name),
+    active person-months, commits naming ticket keys, and the pre-ChatGPT count. Only hashed keys and counts leave."""
+    sep, rec = "\x1f", "\x1e"
+    raw = git(repo, "log", f"--format={rec}%H{sep}%P{sep}%ae{sep}%an{sep}%at{sep}%ct{sep}%s{sep}%b", *rev, *pathspec)
+    ts_of = lambda d: dt.datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc).timestamp()  # noqa: E731
+    c25, c22 = ts_of(cutoff), ts_of(cutoff_early)
+    parent = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    ident_months, ident_commits, ident_tokens = defaultdict(set), Counter(), {}
+    commits = pre25 = pre22 = 0
+    with_ref = fix_with_ref = 0
+    pat_commits, pat_keys = Counter(), defaultdict(set)
+    key_hashes = set()
+    for block in raw.split(rec):
+        if not block.strip():
+            continue
+        f = block.split(sep, 7)
+        if len(f) < 8:
+            continue
+        sha, parents, email, name, at, ct, subject, body = f
+        commits += 1
+        ts = float(at or ct or 0)
+        pre25 += ts < c25
+        pre22 += ts < c22
+        merge = len(parents.split()) > 1
+        if not merge:
+            text = PR_SQUASH_RX.sub("", subject) + "\n" + body
+            pk = {k for k in PROJECT_KEY_RX.findall(text) if k.split("-")[0] not in NOT_TICKET_PREFIXES}
+            hn = {"#" + n for n in HASH_NUMBER_RX.findall(text)}
+            if pk or hn:
+                with_ref += 1
+                if FIX_RX.search(subject):
+                    fix_with_ref += 1
+            for kind, keys in (("project_key", pk), ("hash_number", hn)):
+                if keys:
+                    pat_commits[kind] += 1
+                    pat_keys[kind].update(keys)
+            for k in pk | hn:
+                if len(key_hashes) < KEY_HASH_CAP:
+                    key_hashes.add(link_hash("ticket", k.upper(), salt))
+        if BOT_RX.search(email) or BOT_RX.search(name) or ai_identity(name, email):
+            continue
+        ident = (email.strip().lower(), name.strip())
+        toks = ident_tokens.get(ident)
+        if toks is None:
+            toks = identity_tokens(name, email, salt) or [link_hash("email", ident[0] or ident[1].lower(), salt)]
+            ident_tokens[ident] = toks
+            for t in toks[1:]:
+                parent[find(toks[0])] = find(t)
+            find(toks[0])
+        month = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime("%Y-%m")
+        ident_months[ident].add(month)
+        ident_commits[ident] += 1
+    persons = defaultdict(lambda: {"tokens": set(), "months": set(), "commits": 0})
+    for ident, toks in ident_tokens.items():
+        p = persons[find(toks[0])]
+        p["tokens"].update(toks)
+        p["months"] |= ident_months[ident]
+        p["commits"] += ident_commits[ident]
+    by_year = defaultdict(lambda: {"unique_people": 0, "active_person_months": 0})
+    out_persons = []
+    for p in persons.values():
+        years = Counter(m[:4] for m in p["months"])
+        for y, n in years.items():
+            by_year[y]["unique_people"] += 1
+            by_year[y]["active_person_months"] += n
+        toks = sorted(p["tokens"])
+        out_persons.append({"key": toks[0], "tokens": toks, "months": sorted(p["months"]), "commits": p["commits"]})
+    out_persons.sort(key=lambda x: (x["months"][0] if x["months"] else "", x["key"]))
+    return {
+        "commits": commits, "pre_2025": pre25, "pre_chatgpt": pre22,
+        "people": {"merged_people": len(out_persons), "identities": len(ident_tokens),
+                   "by_year": {y: by_year[y] for y in sorted(by_year)}, "persons": out_persons},
+        "tickets": {"commits_with_ref": with_ref, "share": round(with_ref / commits, 3) if commits else None,
+                    "fix_commits_with_ref": fix_with_ref,
+                    "by_pattern": {k: {"commits": pat_commits.get(k, 0), "distinct_keys": len(pat_keys.get(k, ()))}
+                                   for k in ("project_key", "hash_number")},
+                    "distinct_project_prefixes": len({k.split("-")[0] for k in pat_keys.get("project_key", ())}),
+                    "key_hashes": sorted(key_hashes), "key_hashes_capped": len(key_hashes) >= KEY_HASH_CAP},
+    }
+
+
+CREDENTIAL_NAME_RX = re.compile(r"(^|/)(\.env(\.[a-z]+)?|id_rsa[^/]*|id_ed25519[^/]*|[^/]*\.(pem|key|p12|pfx|keystore|jks|ppk)|"
+                                r"[^/]*credentials[^/]*\.json|service[-_]?account[^/]*\.json)$", re.I)
+CREDENTIAL_OK_RX = re.compile(r"\.(example|sample|template|dist)$|\.pub$", re.I)
+PLATFORM_RX = re.compile(r"(^|/)(ps4|ps5|orbis|prospero|xboxone|xbox_one|xboxseries|scarlett|gdk|gamecore|xdk|switch|nx64|"
+                         r"nintendo|nintendoswitch|nnsdk)(/|$|\.)", re.I)
+MIDDLEWARE_RX = re.compile(r"(^|/)(thirdparty|third_party|3rdparty|plugins/marketplace|assetstoretools|wwise|fmod|"
+                           r"assets/plugins)(/|$)|\.unitypackage$", re.I)
+ENGINE_CONTENT_EXTS = (".uasset", ".umap", ".unity", ".prefab", ".tscn")
+
+
+def flag(value, label, method=None, count=None) -> dict:
+    out = {"value": value, "label": label}
+    if method:
+        out["method"] = method
+    if count is not None:
+        out["count"] = count
+    return out
+
+
+def code_restrictions(names: list, sourcing: dict | None, self_flags: dict, ownership: str | None) -> dict:
+    """Restriction flags for one repository. Recorded, not ruled on: a raised flag says where to look."""
+    creds = sum(1 for p in names if CREDENTIAL_NAME_RX.search(p) and not CREDENTIAL_OK_RX.search(p))
+    plat = sum(1 for p in names if PLATFORM_RX.search(p))
+    mid = sum(1 for p in names if MIDDLEWARE_RX.search(p))
+    third = (sourcing or {}).get("loc_third_party") or 0
+    flags = {
+        "client_owned": flag(None, "unknown", "ownership is a contract question; set --ownership or --flag client_owned"),
+        "platform_nda": (flag(True, "estimated", "console-platform folder or file names tracked", plat) if plat else
+                         flag(False, "estimated", "no console-platform folder or file names tracked")),
+        "third_party_middleware": (flag(True, "verified", "third-party, plugin or middleware paths tracked", mid + (1 if third else 0))
+                                   if mid or third else flag(False, "estimated", "no vendored, plugin or middleware paths tracked")),
+        "player_personal_data": flag(None, "unknown", "code is not read for player records"),
+        "staff_personal_data": flag(None, "unknown", "author identities are hashed, never written"),
+        "secrets": (flag(True, "verified", "credential-like file names tracked (contents never read)", creds) if creds else
+                    flag(False, "estimated", "no credential-like file names tracked; file contents are not scanned")),
+    }
+    for k, v in self_flags.items():
+        flags[k] = flag(v, "self_reported", "stated by the seller")
+    return {"ownership": ownership or "own",
+            "ownership_basis": "self_reported" if ownership else "default (the seller owns its data)", "flags": flags}
+
+
+def labels_for(doc: dict, simple: bool) -> dict:
+    """The label of every material number. Unknown is null, never zero."""
+    g = doc["git"]
+    hist_ok = g.get("commits") is not None and not g.get("history_shallow")
+    L = {}
+
+    def put(path, label, method=None, scope=None):
+        e = {"label": label}
+        if method:
+            e["method"] = method
+        if scope:
+            e["scope"] = scope
+        L[path] = e
+
+    hl, hm = ("verified", None) if hist_ok else ("unknown", "history missing or truncated (shallow clone or no git)")
+    for p in ("git.commits", "git.first_commit", "git.last_commit", "git.pre_cutoff_commits", "git.pre_chatgpt_commits",
+              "git.authors_human", "cutoffs.pre_2025", "cutoffs.pre_chatgpt"):
+        put(p, hl, hm, "history of the measured ref" if hist_ok else None)
+    if g.get("commits") == 0:
+        put("git.commits", "verified", None, "repository has no commits")
+    put("people.merged_people", "estimated" if hist_ok else "unknown",
+        "commit authors merged on email, GitHub noreply login and normalised name" if hist_ok else hm)
+    put("people.by_year", "estimated" if hist_ok else "unknown",
+        "unique merged commit authors per year; active person-months = months with a commit" if hist_ok else hm)
+    put("ticket_refs.commits_with_ref", hl, "commit messages naming a project key (ABC-123) or #123" if hist_ok else hm)
+    if simple:
+        put("tree.code_lines_total", "estimated", "a seeded file sample scaled by file size")
+        put("tests.test_files", "estimated", "path-based count in simple mode")
+    else:
+        put("tree.code_lines_total", "verified", None, "tracked first-party files at the checked-out commit")
+        put("tests.test_files", "verified", None, "tracked test files")
+    put("logic.logic_depth", "estimated", "reviewer census band" if doc["logic"]["authoritative"] == "reviewer_census"
+        else "deterministic band from size, branching, nesting, tests and modularity")
+    cap = ((doc.get("tasks") or {}).get("capacity") or {}).get("mineable_commits")
+    put("tasks.capacity.mineable_commits", "estimated" if cap is not None else "unknown",
+        "commit filters on size, spread and message keywords" if cap is not None else "not run")
+    ca = doc.get("code_age") or {}
+    if ca.get("share_written_since_cutoff") is not None:
+        put("code_age.share_written_since_cutoff", "verified", None, "git blame of every first-party source line")
+    elif ca:
+        put("code_age.share_written_since_cutoff", "unknown", "blame did not cover every file")
+    else:
+        put("code_age.share_written_since_cutoff", "unknown", "code age lane not run")
+    ec, oc = doc.get("engine_content") or {}, doc.get("own_code") or {}
+    for f_ in ("blueprints", "blueprint_nodes"):
+        put(f"engine_content.{f_}", ec.get("label", "unknown"), ec.get("method"))
+    put("own_code.own_loc", oc.get("label", "unknown"), oc.get("method") if oc.get("label") != "verified" else None,
+        "own code at the checked-out commit" if oc.get("label") == "verified" else None)
+    put("own_code.assets_own", "estimated" if oc.get("assets_own") is not None else "unknown",
+        "asset files outside template, bought, plugin, Asset Store, engine and vendored folders" if oc.get("assets_own") is not None else "not run")
+    ct = doc.get("code_table") or {}
+    put("code_table.type", ct.get("type_label", "unknown"), "from ownership and classification" if ct.get("type_label") == "estimated" else None)
+    put("code_table.prs_total", "unknown", "only merged PRs are visible in git history")
+    put("code_table.pct_merged", "unknown", "needs the hosting service's PR list")
+    pf = doc.get("perforce") or {}
+    if pf.get("status") == "counted":
+        put("perforce.submitted_changes", "verified", None, "submitted changelists on the given depot paths")
+    return L
+
+
+# --------------------------------------------------------------------------
+# own code (section 8 rules), Unreal Blueprints, Perforce, the block-E code table
+# --------------------------------------------------------------------------
+
+OWN_SKIP_DIRS = {"Intermediate", "Binaries", "Saved", "DerivedDataCache", "Library", "node_modules", "obj", "Temp", "Logs"} | GENERATED_DIRS
+OWN_VENDOR_DIRS = {"ThirdParty", "thirdparty", "third_party", "3rdparty", "External", "external", "vendor", "Vendor", "Pods",
+                   "Carthage", "bower_components", "site-packages", ".venv", "venv"}
+TEMPLATE_DIRS = {"StarterContent", "ThirdPerson", "ThirdPersonBP", "FirstPerson", "FirstPersonBP", "Mannequin", "Mannequins",
+                 "LevelPrototyping", "Megascans", "MSPresets", "TopDown", "TopDownBP", "VehicleTemplate", "Characters/Mannequins"}
+ASSET_STORE_RX = re.compile(r"^(Assets/(Plugins|AssetStoreTools|Standard Assets|TextMesh Pro|Samples|ThirdParty|Third Party)/)", re.I)
+GENERATED_OWN_RX = re.compile(r"(\.generated\.h|\.gen\.cpp|\.designer\.cs|\.min\.js|\.min\.css)$", re.I)
+BUILD_RULES_RX = re.compile(r"\.(Build|Target)\.cs$")
+COPYRIGHT_RX = re.compile(r"copyright\s*(?:\(c\)|©)?\s*(?:\d{4}(?:\s*[-–,]\s*\d{2,4})*)?\s*,?\s*(?:by\s+)?([^\n*/]{2,80})", re.I)
+UE_DEFAULT_NOTICE = "fill out your copyright notice"
+ASSET_FAMILIES = {"image", "3d", "audio", "video", "engine_asset"}
+OWN_REASONS = ("build_output_or_cache", "engine_source", "generated", "build_rules", "vendored", "third_party_plugin",
+               "unsettled_plugin", "asset_store_package", "template_content", "bought_content", "engine_template_code",
+               "foreign_copyright", "duplicate_content", "settled_excluded")
+BP_FIELDS = ("blueprints", "blueprint_nodes", "level_blueprints", "level_blueprint_nodes", "duplicate_blueprints",
+             "lfs_pointer", "cooked", "unreadable", "files")
+BP_LINE_RX = re.compile(r"([A-Za-z][A-Za-z ]*?) (\d{1,3}(?:,\d{3})*|\d+)(?=, [A-Za-z]|\s*$)")
+
+
+def parse_bp_line(text: str) -> dict:
+    """One line of count_blueprints.py output ('TOTAL: blueprint nodes 1,234, blueprints 12, ...') -> {key: int}."""
+    body = text.split(":", 1)[1] if ":" in text else text
+    out = {}
+    for k, v in BP_LINE_RX.findall(body.strip()):
+        out[re.sub(r"[^a-z0-9]+", "_", k.strip().lower()).strip("_")] = int(v.replace(",", ""))
+    return out
+
+
+def bp_summary(c: dict) -> dict:
+    other = {}
+    for k, v in c.items():
+        m = re.match(r"(.+)_(graphs|nodes)$", k)
+        if m and m.group(1) not in ("blueprint", "level_blueprint"):
+            other.setdefault(m.group(1), {"graphs": 0, "nodes": 0})[m.group(2)] += v
+    out = {f: c.get(f, 0) for f in BP_FIELDS}
+    out["other_graphs"] = other
+    return out
+
+
+def is_lfs_pointer(data: bytes) -> bool:
+    return data.startswith(b"version https://git-lfs")
+
+
+def unreal_roots(names: list) -> list:
+    roots = sorted({str(Path(p).parent) for p in names if p.lower().endswith(".uproject")})
+    if roots:
+        return ["" if r == "." else r for r in roots]
+    content = sorted({p.split("/Content/")[0] if "/Content/" in p else "" for p in names
+                      if p.lower().endswith((".uasset", ".umap")) and (p.startswith("Content/") or "/Content/" in p)})
+    return content[:1]
+
+
+def read_uplugins(repo: Path, names: list) -> dict:
+    """Plugin folder ('<prefix>Plugins/<Name>') -> CreatedBy from its .uplugin (kept in memory only)."""
+    out = {}
+    for p in names:
+        if p.lower().endswith(".uplugin") and "Plugins/" in p:
+            try:
+                created = (json.loads((repo / p).read_text("utf-8-sig", "replace")).get("CreatedBy") or "").strip()
+            except (OSError, ValueError, AttributeError):
+                created = ""
+            out[str(Path(p).parent)] = created
+    return out
+
+
+def plugin_of(p: str) -> str | None:
+    parts = p.split("/")
+    if "Plugins" in parts:
+        i = parts.index("Plugins")
+        if i + 1 < len(parts) - 1:
+            return "/".join(parts[:i + 2])
+    return None
+
+
+def content_folder_of(p: str, roots: list) -> str | None:
+    for r in roots:
+        pre = (r + "/") if r else ""
+        if p.startswith(pre + "Content/"):
+            rest = p[len(pre + "Content/"):].split("/")
+            return (pre + "Content/" + rest[0]) if len(rest) > 1 else (pre + "Content (top level)")
+    return None
+
+
+def studio_match(holder: str, studio: list) -> bool:
+    low = holder.lower()
+    return any(s.lower() in low for s in studio if s)
+
+
+def plugin_class(created: str, studio: list, settle: dict, name: str) -> str:
+    dec = (settle.get("plugins") or {}).get(name.split("/")[-1])
+    if dec:
+        return "own" if dec == "own" else "third_party_plugin"
+    if not created:
+        return "own"
+    if "epic games" in created.lower():
+        return "third_party_plugin"
+    if studio:
+        return "own" if studio_match(created, studio) else "third_party_plugin"
+    return "unsettled_plugin"
+
+
+def content_class(folder: str, settle: dict) -> str:
+    leaf = folder.split("/")[-1]
+    dec = (settle.get("content") or {}).get(leaf)
+    if dec in ("own", "template", "bought"):
+        return dec
+    if leaf in TEMPLATE_DIRS:
+        return "template"
+    if leaf == "Content (top level)":
+        return "own"
+    return "unsettled"
+
+
+def run_blueprints(repo: Path, roots: list, timeout: int = 1800) -> tuple:
+    """Run the vendored counter on each Unreal project root. Returns (total counts, {group: counts}, status)."""
+    total, groups, status = Counter(), {}, "counted"
+    for r in roots:
+        try:
+            out = subprocess.run([sys.executable, str(SCRIPT_DIR_BP / "count_blueprints.py"), str(repo / r) if r else str(repo)],
+                                 capture_output=True, timeout=timeout, check=False).stdout.decode("utf-8", "replace")
+        except (subprocess.TimeoutExpired, OSError):
+            status = "failed"
+            continue
+        for line in out.splitlines():
+            if line.startswith("TOTAL:"):
+                total.update(parse_bp_line(line))
+            elif ": " in line:
+                g, _, _ = line.partition(": ")
+                groups[((r + "/") if r else "") + g] = parse_bp_line(line)
+    return dict(total), groups, status
+
+
+SCRIPT_DIR_BP = Path(__file__).resolve().parent
+
+
+def stage_own_code(repo: Path, studio: list, settle: dict, bp: bool = True) -> dict:
+    """Own lines of code under the section 8 rules: non-blank lines including comments, after the exclusions, each
+    distinct file content once. Returns public counts plus a private settling list (names, kept out of measure.json)."""
+    files = list_files(repo)
+    names = [p for p, _ in files]
+    roots = unreal_roots(names)
+    plugins = read_uplugins(repo, names)
+    engine_fork = any(p.startswith("Engine/Build/Build.version") or p == "Engine/Build/Build.version" for p in names)
+    file_settle = settle.get("files") or {}
+    rows = []  # (path, lang, loc, reason, holder, blob)
+    holders = Counter()
+    for p, blob in files:
+        ext = Path(p).suffix.lower()
+        lang = LANG_BY_EXT.get(ext)
+        if not lang:
+            continue
+        parts = p.split("/")
+        reason = holder = None
+        if any(x in OWN_SKIP_DIRS for x in parts[:-1]):
+            reason = "build_output_or_cache"
+        elif parts[0] == "Engine" and (engine_fork or len(parts) > 2) or "/Engine/Source/" in "/" + p:
+            reason = "engine_source"
+        elif GENERATED_OWN_RX.search(p) or vendor_kind(p) == "generated":
+            reason = "generated"
+        elif BUILD_RULES_RX.search(p):
+            reason = "build_rules"
+        elif any(x in OWN_VENDOR_DIRS for x in parts[:-1]):
+            reason = "vendored"
+        elif ASSET_STORE_RX.search(p):
+            reason = "asset_store_package"
+        else:
+            pl = plugin_of(p)
+            if pl and pl in plugins:
+                cls = plugin_class(plugins[pl], studio, settle, pl)
+                reason = None if cls == "own" else cls
+            if reason is None and any(x in TEMPLATE_DIRS for x in parts[:-1]):
+                reason = "template_content"
+        text = None
+        if reason is None or reason == "duplicate_content":
+            text = read_text(repo / p)
+            if text is None:
+                continue
+            head = "\n".join(text.splitlines()[:20])
+            if GENERATED_MARKER.search("\n".join(text.splitlines()[:5])):
+                reason = "generated"
+            elif UE_DEFAULT_NOTICE not in head.lower():
+                m = COPYRIGHT_RX.search(head)
+                if m:
+                    holder = re.sub(r"\s+", " ", m.group(1)).strip(" .,;:-")
+                    holder = re.sub(r"(?i)\s*all rights reserved.*$", "", holder).strip(" .,;:-") or None
+        else:
+            text = read_text(repo / p)
+            if text is None:
+                continue
+        loc = sum(1 for line in text.splitlines() if line.strip())
+        if holder and not reason:
+            if "epic games" in holder.lower():
+                reason = "engine_template_code"
+            else:
+                holders[holder.lower()] += 1
+        rows.append([p, lang, loc, reason, holder, blob or h(text)])
+    presumed = None
+    if not studio and holders:
+        presumed = holders.most_common(1)[0][0]
+    unsettled_copyright = 0
+    for r in rows:
+        if r[3] is None and r[4]:
+            if studio:
+                if not studio_match(r[4], studio):
+                    r[3] = "foreign_copyright"
+            elif r[4].lower() != presumed:
+                r[3] = "foreign_copyright"
+                unsettled_copyright += 1
+        dec = file_settle.get(r[0])
+        if dec == "own":
+            r[3] = None
+        elif dec == "excluded":
+            r[3] = r[3] or "settled_excluded"
+    seen = set()
+    for r in rows:
+        if r[3] is None:
+            if r[5] in seen:
+                r[3] = "duplicate_content"
+            seen.add(r[5])
+    own = [r for r in rows if r[3] is None]
+    by_lang = Counter()
+    for r in own:
+        by_lang[r[1]] += r[2]
+    excluded = {}
+    for r in rows:
+        if r[3]:
+            e = excluded.setdefault(r[3], {"files": 0, "loc": 0})
+            e["files"] += 1
+            e["loc"] += r[2]
+    # content folders, assets own/excluded, Blueprints per group
+    folders = defaultdict(lambda: {"files": 0})
+    assets_own = assets_excluded = 0
+    for p in names:
+        fam = family_of(Path(p).suffix.lower())
+        if fam not in ASSET_FAMILIES or p.endswith(".meta"):
+            continue
+        parts = p.split("/")
+        cf = content_folder_of(p, roots)
+        if cf:
+            folders[cf]["files"] += 1
+        pl = plugin_of(p)
+        excl = (any(x in TEMPLATE_DIRS for x in parts[:-1]) or ASSET_STORE_RX.search(p) or parts[0] == "Engine"
+                or any(x in OWN_VENDOR_DIRS for x in parts[:-1])
+                or (pl in plugins and plugin_class(plugins[pl], studio, settle, pl) != "own")
+                or (cf is not None and content_class(cf, settle) in ("template", "bought")))
+        if excl:
+            assets_excluded += 1
+        else:
+            assets_own += 1
+    lfs = 0
+    for p in names:
+        if p.lower().endswith((".uasset", ".umap")):
+            try:
+                with (repo / p).open("rb") as f:
+                    lfs += is_lfs_pointer(f.read(64))
+            except OSError:
+                pass
+    bp_total, bp_groups, bp_status = ({}, {}, "not_unreal") if not roots else (run_blueprints(repo, roots) if bp else ({}, {}, "not_run"))
+    split = {"own": Counter(), "excluded": Counter()}
+    private_groups = []
+    for g, c in bp_groups.items():
+        if "/Plugins/" in "/" + g or g.startswith("Plugins/"):
+            pl = g if g in plugins else next((k for k in plugins if k.endswith(g.split("Plugins/", 1)[1])), None)
+            cls = plugin_class(plugins.get(pl, ""), studio, settle, g) if pl else "unsettled_plugin"
+        else:
+            cls = content_class(g, settle)
+        split["excluded" if cls in ("template", "bought", "third_party_plugin") else "own"].update(c)
+        private_groups.append({"group": g, "class": cls, "files": c.get("files", 0),
+                               "blueprints": c.get("blueprints", 0) + c.get("level_blueprints", 0),
+                               "blueprint_nodes": c.get("blueprint_nodes", 0) + c.get("level_blueprint_nodes", 0)})
+    for g, v in folders.items():
+        if g not in bp_groups:
+            private_groups.append({"group": g, "class": content_class(g, settle), "files": v["files"], "blueprints": 0, "blueprint_nodes": 0})
+    cf_classes = Counter(content_class(g, settle) for g in folders)
+    plugin_rows = [{"plugin": k, "created_by": v, "class": plugin_class(v, studio, settle, k),
+                    "loc": sum(r[2] for r in rows if plugin_of(r[0]) == k)} for k, v in sorted(plugins.items())]
+    non_cpp = Counter()
+    if roots:
+        for r in own:
+            if r[1] not in ("C++", "C/C++ header", "C", "Shader"):
+                non_cpp[(r[0].split("/")[0], r[1])] += r[2]
+    private = {
+        "content_folders": sorted(private_groups, key=lambda x: x["group"]),
+        "plugins": plugin_rows,
+        "foreign_copyright_files": [{"path": r[0], "holder": r[4], "loc": r[2]} for r in rows if r[3] == "foreign_copyright"],
+        "non_cpp_code_in_unreal": [{"top_folder": k[0], "language": k[1], "loc": v} for k, v in sorted(non_cpp.items())],
+        "presumed_studio_holder": presumed,
+    }
+    unsettled = {"content_folders": cf_classes.get("unsettled", 0),
+                 "plugins": sum(1 for x in plugin_rows if x["class"] == "unsettled_plugin"),
+                 "copyright_holders_presumed": bool(presumed), "foreign_copyright_files": excluded.get("foreign_copyright", {}).get("files", 0),
+                 "non_cpp_code_in_unreal_loc": sum(non_cpp.values())}
+    return {
+        "own_loc": sum(r[2] for r in own), "own_files": len(own), "by_language": dict(by_lang.most_common()),
+        "excluded": {k: excluded[k] for k in OWN_REASONS if k in excluded},
+        "excluded_loc": sum(e["loc"] for e in excluded.values()),
+        "unreal_projects": len(roots), "engine_fork": engine_fork, "studio_names_given": bool(studio), "settled": bool(settle),
+        "content_folders": {"total": len(folders), "own": cf_classes.get("own", 0), "template": cf_classes.get("template", 0),
+                            "bought": cf_classes.get("bought", 0), "unsettled": cf_classes.get("unsettled", 0)},
+        "assets_own": assets_own, "assets_excluded": assets_excluded, "lfs_pointer_assets": lfs,
+        "unsettled": unsettled,
+        "_bp": {"status": bp_status, "total": bp_total, "own": dict(split["own"]), "excluded": dict(split["excluded"])},
+        "_private": private,
+    }
+
+
+def blueprint_block(own: dict, names: list) -> dict:
+    """engine_content: Unreal Blueprints and nodes from the vendored counter, plus engine file counts."""
+    counts = Counter(Path(p).suffix.lower() for p in names if Path(p).suffix.lower() in ENGINE_CONTENT_EXTS)
+    bp = own["_bp"]
+    base = {"files_by_type": {e[1:]: counts.get(e, 0) for e in ENGINE_CONTENT_EXTS}, "files_label": "verified",
+            "counter": "count_blueprints.py (studio data assessment skill)", "status": bp["status"]}
+    if bp["status"] == "not_unreal":
+        return dict(base, blueprints=None, blueprint_nodes=None, level_blueprints=None, level_blueprint_nodes=None,
+                    other_graphs={}, label="not_applicable", method="no Unreal project in this repository")
+    if bp["status"] != "counted" or not bp["total"]:
+        return dict(base, blueprints=None, blueprint_nodes=None, level_blueprints=None, level_blueprint_nodes=None,
+                    other_graphs={}, label="unknown", method="the Blueprint counter did not run or failed")
+    t = bp_summary(bp["total"])
+    incomplete = t["lfs_pointer"] + t["cooked"] + t["unreadable"]
+    out = dict(base, **t)
+    out["own"] = {k: bp_summary(bp["own"])[k] for k in ("blueprints", "blueprint_nodes", "level_blueprints", "level_blueprint_nodes")}
+    out["excluded"] = {k: bp_summary(bp["excluded"])[k] for k in ("blueprints", "blueprint_nodes", "level_blueprints", "level_blueprint_nodes")}
+    if incomplete:
+        out.update(label="estimated", partial=True, partial_reason="counts incomplete",
+                   method=f"{t['lfs_pointer']} LFS pointers, {t['cooked']} cooked and {t['unreadable']} unreadable assets were not counted; "
+                          "pull LFS content for Content/ and measure the editor project, not a packaged build")
+    else:
+        out.update(label="verified", partial=False, partial_reason=None,
+                   method="Blueprint graph nodes counted from package headers; identical Blueprints counted once")
+    return out
+
+
+def stage_p4(paths: list) -> dict:
+    """Perforce history, read-only: submitted changelists across the given depot paths or streams (each changelist
+    once, so every stream's history is added without double counting), dates, submitting accounts, server users.
+    This contacts the configured Perforce server with the user's existing login."""
+    if not paths:
+        return {"status": "not_requested"}
+    if not shutil.which("p4"):
+        return {"status": "cli_missing", "label": "unknown", "method": "p4 command not found"}
+    changes, times, users = set(), [], set()
+    try:
+        for path in paths:
+            out = subprocess.run(["p4", "-ztag", "changes", "-s", "submitted", path], capture_output=True, timeout=1800,
+                                 check=False).stdout.decode("utf-8", "replace")
+            cur = {}
+            for line in out.splitlines() + ["... change END"]:
+                m = re.match(r"^\.\.\. (\w+) (.*)$", line)
+                if not m:
+                    continue
+                k, v = m.groups()
+                if k == "change":
+                    if cur.get("change"):
+                        changes.add(cur["change"])
+                        if cur.get("time", "").isdigit():
+                            times.append(int(cur["time"]))
+                        if cur.get("user"):
+                            users.add(h(cur["user"].lower()))
+                    cur = {"change": v.strip()}
+                else:
+                    cur[k] = v.strip()
+        uout = subprocess.run(["p4", "-ztag", "users"], capture_output=True, timeout=600, check=False).stdout.decode("utf-8", "replace")
+        server_users = sum(1 for line in uout.splitlines() if line.startswith("... User "))
+    except (subprocess.TimeoutExpired, OSError):
+        return {"status": "failed", "label": "unknown", "method": "p4 did not answer"}
+    return {"status": "counted", "paths": len(paths), "submitted_changes": len(changes),
+            "first_change": iso_day(min(times)) if times else None, "last_change": iso_day(max(times)) if times else None,
+            "submitting_accounts": len(users), "server_users": server_users, "label": "verified",
+            "method": "p4 changes -s submitted per path (each changelist once) and p4 users; accounts, not people; "
+                      "code is counted once from the working copy"}
+
+
+PROJECT_TYPES = ("own_game", "client_game", "prototype", "tool", "engine")
+
+
+def code_table(doc: dict, own: dict, project_type: str | None) -> dict:
+    g, b, ec, cl = doc["git"], doc.get("build") or {}, doc.get("engine_content") or {}, doc.get("classification") or {}
+    rs, pf = doc.get("restrictions") or {}, doc.get("perforce") or {}
+    if project_type:
+        typ, tlab = project_type, "self_reported"
+    else:
+        typ = ("client_game" if rs.get("ownership") == "client_owned" else "prototype" if cl.get("is_likely_demo")
+               else "own_game" if cl.get("primary_class") == "game" else "tool")
+        tlab = "estimated"
+    vcs = "+".join(x for x, ok in (("git", g.get("commits") is not None), ("perforce", pf.get("status") == "counted")) if ok) or "none"
+    eng = b.get("engine") or ("unreal" if own.get("unreal_projects") else None)
+    return {
+        "project": doc["label"], "type": typ, "type_label": tlab,
+        "engine": (eng + (" " + b["engine_version"] if b.get("engine_version") else "")) if eng else None, "vcs": vcs,
+        "own_loc": own["own_loc"], "primary_language": next(iter(own["by_language"]), None),
+        "blueprints": ec.get("blueprints"), "blueprint_nodes": ec.get("blueprint_nodes"),
+        "commits": g.get("commits") if g.get("commits") is not None else pf.get("submitted_changes"),
+        "contributors_people": (doc.get("people") or {}).get("merged_people"),
+        "prs_merged": g.get("pr_merged_count"), "prs_total": None, "pct_merged": None,
+        "source_files": doc["tree"].get("source_files"), "test_files": doc["tests"].get("test_files"),
+        "first_commit": g.get("first_commit") or pf.get("first_change"), "last_commit": g.get("last_commit") or pf.get("last_change"),
+        "assets_own": own["assets_own"], "assets_excluded": own["assets_excluded"],
+    }
+
+
+def write_private(out: Path, own: dict, label: str) -> None:
+    """The settling list holds folder, plugin and file names for the studio to confirm. It stays on this machine,
+    under <out>/.private/, and never enters measure.json or report.md."""
+    pv = own.get("_private") or {}
+    d = out / ".private"
+    d.mkdir(parents=True, exist_ok=True)
+    atomic_write(d / "settling.json", json.dumps(pv, indent=1))
+    L = [f"# Settling list for {label} (PRIVATE: names and paths; never share; delete before handing anything over)", "",
+         "Mark each item own / template / bought (Content folders), own / third_party (plugins) or own / excluded (files) in a "
+         "settle.json and re-run measure_code.py with --settle settle.json. --studio-name sets who counts as the studio.", "",
+         "## Top-level Content folders and plugin content", "", "| group | current class | asset files | Blueprints (incl. Level) | nodes |", "|---|---|---|---|---|"]
+    L += [f"| {x['group']} | {x['class']} | {x.get('files', 0):,} | {x.get('blueprints', 0):,} | {x.get('blueprint_nodes', 0):,} |"
+          for x in pv.get("content_folders", [])] or ["| none | | | | |"]
+    L += ["", "## Plugins", "", "| plugin | CreatedBy | class | LOC |", "|---|---|---|---|"]
+    L += [f"| {x['plugin']} | {x['created_by'] or '(empty)'} | {x['class']} | {x['loc']:,} |" for x in pv.get("plugins", [])] or ["| none | | | |"]
+    L += ["", "## Files excluded for a copyright header naming another holder", "",
+          f"Presumed studio holder (no --studio-name given): {pv.get('presumed_studio_holder') or 'n/a'}", "",
+          "| file | holder | LOC |", "|---|---|---|"]
+    L += [f"| {x['path']} | {x['holder']} | {x['loc']:,} |" for x in pv.get("foreign_copyright_files", [])] or ["| none | | |"]
+    L += ["", "## Non-C++ code inside Unreal projects (often Android/iOS template or SDK glue: confirm it is the studio's own)", "",
+          "| top folder | language | LOC |", "|---|---|---|"]
+    L += [f"| {x['top_folder']} | {x['language']} | {x['loc']:,} |" for x in pv.get("non_cpp_code_in_unreal", [])] or ["| none | | |"]
+    atomic_write(d / "settling.md", "\n".join(L) + "\n")
+
+
+# --------------------------------------------------------------------------
 # derived: classification, logic band, tasks, recommendation
 # --------------------------------------------------------------------------
 
@@ -1552,6 +2219,13 @@ STRING_FIELDS = [re.compile(p) for p in (
     r"^census\.(themes\[\d+\]|ideas\[\d+\]\.(kind|text)|categories\.\w+\[\d+\]|summary|reviewer|model|weights_version|"
     r"task_mining\.(status|skip_reason)|what_could_not_be_assessed\[\d+\])$",
     r"^recommendation\.(full_run|reasons\[\d+\])$", r"^privacy\.\w+$", r"^provenance\.\w+$",
+    r"^cutoff_early$", r"^cutoffs\.\w+\.(date|label|unit)$", r"^labels\.[a-z0-9_.]+\.(label|method|scope)$",
+    r"^restrictions\.(ownership|ownership_basis)$", r"^restrictions\.flags\.\w+\.(label|method)$",
+    r"^people\.(label|method)$", r"^people\.persons\[\d+\]\.(key|tokens\[\d+\]|months\[\d+\])$",
+    r"^ticket_refs\.(label|method|key_hashes\[\d+\])$",
+    r"^engine_content\.(label|todo|files_label|counter|status|method|partial_reason)$", r"^own_code\.(label|method)$",
+    r"^perforce\.(status|label|method|first_change|last_change)$",
+    r"^code_table\.(project|type|type_label|engine|vcs|primary_language|first_commit|last_commit)$",
 )]
 EMAIL_RX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 ABS_PATH_RX = re.compile(r"(^|[\s\"'(])(/(Users|home|Volumes|mnt|var|tmp|opt|private)/|[A-Za-z]:\\)")
@@ -1573,6 +2247,9 @@ def keys_ok(obj, path="") -> list:
     bad = []
     if isinstance(obj, dict):
         for k, v in obj.items():
+            if path == "labels" and re.match(r"^[a-z0-9_.]+$", str(k)):
+                bad += keys_ok(v, f"{path}.{k}")
+                continue
             vocab = k in LANGUAGES or path.endswith(("config_and_docs_files", "class_scores")) or k in NON_CODE_LANGS.values()
             if not (KEY_RX.match(str(k)) or vocab):
                 bad.append(f"{path}.{k}: undeclared key")
@@ -1592,7 +2269,7 @@ def boundary(doc: dict, denylist: set) -> list:
         if not any(rx.match(path) for rx in STRING_FIELDS):
             problems.append(f"{path}: text in an undeclared field")
             continue
-        if path in ("label",) or path.startswith("tags"):
+        if path in ("label", "code_table.project") or path.startswith("tags"):
             continue  # chosen by the user
         if EMAIL_RX.search(v):
             problems.append(f"{path}: looks like an email address")
@@ -1663,7 +2340,15 @@ def summary_row(doc: dict) -> dict:
         "last_commit": g["last_commit"], "span_days": g["span_days"], "active_days": g["active_days"],
         "active_months": g["active_months"], "history_shallow": g.get("history_shallow"), "history_complete": g.get("history_complete"),
         "history_ref": (doc.get("history_ref") or {}).get("measured"),
-        "pre_cutoff_share": g["pre_cutoff_share"],
+        "pre_cutoff_share": g["pre_cutoff_share"], "pre_chatgpt_share": g.get("pre_chatgpt_share"),
+        "people_merged": (doc.get("people") or {}).get("merged_people"),
+        "commits_with_ticket_ref": (doc.get("ticket_refs") or {}).get("commits_with_ref"),
+        "ownership": (doc.get("restrictions") or {}).get("ownership"),
+        "own_loc": (doc.get("own_code") or {}).get("own_loc"), "own_loc_label": (doc.get("own_code") or {}).get("label"),
+        "blueprints": (doc.get("engine_content") or {}).get("blueprints"),
+        "blueprint_nodes": (doc.get("engine_content") or {}).get("blueprint_nodes"),
+        "fresh_upload": doc["git"].get("fresh_upload"),
+        "restriction_flags": ";".join(k for k, v in ((doc.get("restrictions") or {}).get("flags") or {}).items() if v.get("value")) or None,
         "code_written_since_cutoff_share": ca.get("share_written_since_cutoff"),
         "code_age_status": ca.get("status"), "code_age_coverage": ca.get("coverage_share"),
         "pr_merged_count": g.get("pr_merged_count"), "ai_assisted_share": g.get("ai_assisted_share"),
@@ -1685,6 +2370,74 @@ def summary_row(doc: dict) -> dict:
 
 
 AUTH_LABEL = {"deterministic": "deterministic band", "reviewer_census": "reviewer census"}
+
+
+def own_code_section(doc: dict) -> list:
+    oc, ec, ct, pf = doc.get("own_code") or {}, doc.get("engine_content") or {}, doc.get("code_table") or {}, doc.get("perforce") or {}
+    L = ["", "## 12. Own code, Blueprints and the code table", ""]
+    if oc.get("own_loc") is None:
+        L.append("Own code was not counted (simple mode).")
+    else:
+        L += [f"Own lines of code (label {oc['label']}): **{fmt(oc['own_loc'])}** in {fmt(oc['own_files'])} files "
+              f"(non-blank lines including comments, each distinct file once); excluded {fmt(oc['excluded_loc'])} lines:", "",
+              "| excluded because | files | lines |", "|---|---|---|"]
+        L += [f"| {k.replace('_', ' ')} | {fmt(v['files'])} | {fmt(v['loc'])} |" for k, v in oc["excluded"].items()] or ["| nothing excluded | | |"]
+        cf = oc.get("content_folders") or {}
+        if cf.get("total"):
+            L += ["", f"Top-level Content folders: {fmt(cf['total'])} ({fmt(cf['own'])} own, {fmt(cf['template'])} template, "
+                      f"{fmt(cf['bought'])} bought, {fmt(cf['unsettled'])} to settle with the studio)."]
+        if oc["label"] != "verified":
+            L += ["", f"_To settle: {oc['method'].split('; to settle: ')[-1]}. The names are in the private settling list on this machine._"]
+    if ec.get("label") == "not_applicable":
+        L += ["", "Blueprints: not applicable (no Unreal project in this repository)."]
+    else:
+        L += ["", f"Blueprints ({ec.get('label')}{', ' + ec['partial_reason'] if ec.get('partial_reason') else ''}): {fmt(ec.get('blueprints'))} Blueprints, {fmt(ec.get('blueprint_nodes'))} nodes; "
+                f"Level Blueprints {fmt(ec.get('level_blueprints'))} with {fmt(ec.get('level_blueprint_nodes'))} nodes"
+                + (f"; other graphs: " + ", ".join(f"{k.replace('_', ' ')} {fmt(v['graphs'])} ({fmt(v['nodes'])} nodes)"
+                                                   for k, v in (ec.get('other_graphs') or {}).items()) if ec.get("other_graphs") else "")
+                + (f". {ec['method']}" if ec.get("method") else "") + "."]
+    if ec.get("own"):
+        L.append(f"Own Blueprints {fmt(ec['own']['blueprints'])} ({fmt(ec['own']['blueprint_nodes'])} nodes); excluded "
+                 f"{fmt(ec['excluded']['blueprints'])} ({fmt(ec['excluded']['blueprint_nodes'])} nodes).")
+    if pf.get("status") not in (None, "not_requested"):
+        L += ["", f"Perforce: {pf['status'].replace('_', ' ')}" + (f"; {fmt(pf['submitted_changes'])} submitted changelists, "
+              f"{pf['first_change']} to {pf['last_change']}, {fmt(pf['submitting_accounts'])} submitting accounts, "
+              f"{fmt(pf['server_users'])} server users" if pf["status"] == "counted" else "") + "."]
+    if doc["git"].get("fresh_upload"):
+        L += ["", "**Fresh upload:** few commits over a few days. The real history is missing or lives elsewhere (an old server, "
+                  "another host); find it or state that it is missing."]
+    cols = ("project", "type", "engine", "vcs", "own_loc", "primary_language", "blueprints", "blueprint_nodes", "commits",
+            "contributors_people", "prs_merged", "pct_merged", "source_files", "test_files")
+    L += ["", "Code table (block E):", "", "| " + " | ".join(c.replace("_", " ") for c in cols) + " | first / last commit | assets own / excluded |",
+          "|" + "---|" * (len(cols) + 2),
+          "| " + " | ".join(str(ct.get(c)) if isinstance(ct.get(c), str) else fmt(ct.get(c)) for c in cols)
+          + f" | {ct.get('first_commit') or 'n/a'} / {ct.get('last_commit') or 'n/a'} | {fmt(ct.get('assets_own'))} / {fmt(ct.get('assets_excluded'))} |"]
+    return L
+
+
+def people_section(doc: dict) -> list:
+    pe, tr, rs, ec = doc.get("people") or {}, doc.get("ticket_refs") or {}, doc.get("restrictions") or {}, doc.get("engine_content") or {}
+    L = ["", "## 11. People by year, ticket references and restrictions", "",
+         f"People (merged identities, label {pe.get('label', 'unknown')}): {fmt(pe.get('merged_people'))} from "
+         f"{fmt(pe.get('identities'))} author identities. Only hashed keys are kept."]
+    if pe.get("by_year"):
+        L += ["", "| year | unique people | active person-months |", "|---|---|---|"]
+        L += [f"| {y} | {fmt(v['unique_people'])} | {fmt(v['active_person_months'])} |" for y, v in pe["by_year"].items()]
+    bp = tr.get("by_pattern") or {}
+    L += ["", f"Commits naming a ticket (label {tr.get('label', 'unknown')}): {fmt(tr.get('commits_with_ref'))} "
+              f"({fmt(tr.get('share'))}); of them fixes {fmt(tr.get('fix_commits_with_ref'))}. Project keys (ABC-123): "
+              f"{fmt((bp.get('project_key') or {}).get('commits'))} commits, {fmt((bp.get('project_key') or {}).get('distinct_keys'))} keys; "
+              f"#123 references: {fmt((bp.get('hash_number') or {}).get('commits'))} commits, "
+              f"{fmt((bp.get('hash_number') or {}).get('distinct_keys'))} keys. Hashed keys let master-valuate link resolved bugs to fixes."]
+    fb = ec.get("files_by_type") or {}
+    L += ["", "Engine content tracked: " + ", ".join(f"{k} {fmt(v)}" for k, v in fb.items()) + "."]
+    if rs:
+        L += ["", f"Ownership: {rs.get('ownership')} ({rs.get('ownership_basis')}). Restriction flags (recorded, not ruled on):", "",
+              "| flag | value | label | basis |", "|---|---|---|---|"]
+        for k, v in rs.get("flags", {}).items():
+            val = "unknown" if v.get("value") is None else ("yes" if v["value"] else "no")
+            L.append(f"| {k.replace('_', ' ')} | {val}{' (' + fmt(v['count']) + ')' if v.get('count') else ''} | {v['label']} | {v.get('method', '')} |")
+    return L
 
 
 def render_report(doc: dict) -> str:
@@ -1721,6 +2474,8 @@ def render_report(doc: dict) -> str:
           f"- {fmt(g['pre_cutoff_share'])} of commits are dated before {doc['cutoff']}"
           + (f"; {fmt(doc['code_age']['share_written_since_cutoff'])} of today's code lines were written after it"
              if doc.get("code_age") and doc["code_age"].get("share_written_since_cutoff") is not None else ""),
+          f"- {fmt(g.get('pre_chatgpt_share'))} ({fmt(g.get('pre_chatgpt_commits'))} commits) are dated before "
+          f"{doc.get('cutoff_early', '2022-11-30')} (pre-ChatGPT)",
           f"- Logic depth **{lg['logic_depth']}/6** (from the {AUTH_LABEL.get(lg['authoritative'], lg['authoritative'])}"
           + (f"; deterministic band {lg['deterministic_depth']}/6" if lg["authoritative"] != "deterministic" else "") + ")",
           *([] if simple else [f"- Capacity: {fmt((tk.get('capacity') or {}).get('mineable_commits'))} mineable commits; "
@@ -1832,6 +2587,8 @@ def render_report(doc: dict) -> str:
             L += [f"| total (cap {tm.get('cap')}) | {fmt(tm.get('ideas_total'))} |"]
         if c and c.get("ideas"):
             L += ["", "Generic task ideas:", ""] + [f"- {i['kind'].replace('_', ' ')}: {i['text']}" for i in c["ideas"]]
+    L += people_section(doc)
+    L += own_code_section(doc)
     L += ["", "## Lanes", ""] + [f"- {k}: {v}" for k, v in doc["lanes"].items()]
     pv = doc.get("provenance") or {}
     if pv:
@@ -1839,7 +2596,8 @@ def render_report(doc: dict) -> str:
               f"payload digest `{pv.get('payload_digest')}`",
               "- A buyer can check these numbers on their own copy: `measure_code.py <repo> --verify measure.json`."]
     L += ["", "## Caveats", "",
-          "- Authors are keyed on email; one person with several emails counts more than once.",
+          "- `authors_human` is keyed on email; `people.merged_people` merges emails, GitHub noreply logins and normalised names, "
+          "so it can also merge two different people who share a name.",
           "- Commit kinds come from message keywords plus the diff shape (a fix must delete lines); they are signals, not verified labels.",
           "- Functions and nesting come from regexes and indentation, not a parser.",
           "- AI-assisted counts see only known agent addresses and product names in trailers and accounts; tools that leave neither are invisible.",
@@ -1866,7 +2624,7 @@ def dream_mod():
 
 def scripts_digest() -> str:
     hh = hashlib.sha256()
-    for name in ("measure_code.py", "add_census.py", "add_dream.py"):
+    for name in ("measure_code.py", "add_census.py", "add_dream.py", "count_blueprints.py"):
         f = SCRIPT_DIR / name
         if f.exists():
             hh.update(f.read_bytes())
@@ -1880,7 +2638,9 @@ def payload_digest(doc: dict) -> str:
 
 
 STABLE_FIELDS = ("git.commits", "git.merge_commits", "git.authors_human", "git.authors_bot", "git.first_commit", "git.last_commit",
-                 "git.pre_cutoff_commits", "git.pr_merged_count", "git.ai_coauthored_commits", "tree.code_lines_total",
+                 "git.pre_cutoff_commits", "git.pre_chatgpt_commits", "people.merged_people",
+                 "ticket_refs.commits_with_ref", "own_code.own_loc", "engine_content.blueprints",
+                 "engine_content.blueprint_nodes", "git.pr_merged_count", "git.ai_coauthored_commits", "tree.code_lines_total",
                  "tree.source_files", "tree.tracked_files", "tests.test_files", "tests.tests_declared", "tasks.candidates_total",
                  "tasks.capacity.mineable_commits", "fingerprints.root_commits", "fingerprints.commit_sketch",
                  "fingerprints.content_sketch", "provenance.head_commit_fingerprint", "provenance.measured_commit_fingerprint",
@@ -1910,6 +2670,7 @@ def verify(claimed_path: Path, repo: Path, a) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="measure-code-verify-"))
     try:
         argv = [str(repo), "--out", str(tmp / "out"), "--mode", claimed.get("mode", "full"), "--cutoff", claimed.get("cutoff", "2025-01-01"),
+                "--cutoff-early", claimed.get("cutoff_early") or "2022-11-30",
                 "--label", claimed.get("label") or "verify", "--build", "detect", "--force",
                 "--blame-seconds", str((claimed.get("code_age") or {}).get("budget_seconds") or 0)]
         policy = (claimed.get("history_ref") or {}).get("policy")
@@ -1926,6 +2687,10 @@ def verify(claimed_path: Path, repo: Path, a) -> int:
         shutil.rmtree(tmp, ignore_errors=True)
     for f in STABLE_FIELDS:
         x, y = dig(claimed, f), dig(fresh, f)
+        oc_ = claimed.get("own_code") or {}
+        if f == "own_code.own_loc" and (oc_.get("studio_names_given") or oc_.get("settled")):
+            lines.append((f, "skipped (counted with --studio-name or --settle; re-run with the same inputs to compare)"))
+            continue
         if f == "code_age.share_written_since_cutoff" and (x is None or y is None):
             lines.append((f, "skipped (blame incomplete on one side)"))
             continue
@@ -1957,11 +2722,28 @@ def main(argv=None) -> int:
     ap.add_argument("repo", type=Path)
     ap.add_argument("--out", type=Path, help="output folder (outside the repo); required unless --verify")
     ap.add_argument("--mode", choices=["simple", "full"], default="full",
-                    help="simple = fast listing and metadata, sampled, every figure an estimate (recommended first run); full = every lane (default)")
+                    help="full = every lane (default); simple (optional) = a fast sampled pass, every figure an estimate, used only when asked to do a quick look")
     ap.add_argument("--label", help="name shown in the output (default: folder name)")
     ap.add_argument("--tag", action="append", default=[], help="cross-linking tag, e.g. project:alpha (repeatable)")
     ap.add_argument("--cutoff", default="2025-01-01",
                     help="date for pre-cutoff shares (default 2025-01-01: buyers price work written before 2025)")
+    ap.add_argument("--cutoff-early", default="2022-11-30",
+                    help="second cutoff (default 2022-11-30, the public ChatGPT launch): pre-ChatGPT counts and shares")
+    ap.add_argument("--link-salt", default="",
+                    help="secret mixed into the hashed person and ticket keys; pass the same value to every run of a studio")
+    ap.add_argument("--flag", action="append", default=[], metavar="NAME[=no]",
+                    help="self-reported restriction flag: " + ", ".join(RESTRICTION_FLAGS) + " (repeatable; NAME=no records false)")
+    ap.add_argument("--ownership", choices=["own", "client_owned", "unclear"],
+                    help="self-reported ownership of this repository (default: own)")
+    ap.add_argument("--studio-name", action="append", default=[],
+                    help="the studio's name or a former name (repeatable): plugins whose CreatedBy and files whose copyright "
+                         "header name it count as own code; without it, the most common copyright holder is presumed the studio")
+    ap.add_argument("--settle", type=Path, help="settle.json from the studio: {content: {folder: own|template|bought}, "
+                                                "plugins: {name: own|third_party}, files: {path: own|excluded}}")
+    ap.add_argument("--p4-path", action="append", default=[], metavar="//depot/path/...",
+                    help="also count Perforce history read-only for this depot path or stream (repeatable; contacts the "
+                         "configured Perforce server with the user's login; each changelist counted once)")
+    ap.add_argument("--project-type", choices=PROJECT_TYPES, help="self-reported project type for the code table")
     ap.add_argument("--ref", choices=["auto", "head"], default="auto",
                     help="auto (default) = measure history on the deepest branch when it is clearly deeper than HEAD; head = HEAD only")
     ap.add_argument("--all-refs", action="store_true", help="count the union of every branch and tag")
@@ -1986,6 +2768,14 @@ def main(argv=None) -> int:
     repo = a.repo.expanduser().resolve()
     if not repo.is_dir():
         ap.error("repository folder not found")
+    self_flags = {}
+    for f_ in a.flag:
+        k_, _, v_ = f_.partition("=")
+        if k_ not in RESTRICTION_FLAGS:
+            ap.error(f"--flag must be one of {', '.join(RESTRICTION_FLAGS)}")
+        self_flags[k_] = v_.strip().lower() not in ("no", "false", "0")
+    if self_flags.get("client_owned") and not a.ownership:
+        a.ownership = "client_owned"
     if a.verify:
         return verify(a.verify.expanduser().resolve(), repo, a)
     if not a.out:
@@ -1997,6 +2787,7 @@ def main(argv=None) -> int:
     simple = a.mode == "simple"
     st = Stages(out, a.force, a.mode)
     lanes, reasons, info = {}, [], {}
+    ppl = None
     state = repo_state(repo)
     pathspec = ["--", "."] if state["subtree"] else []
     ref = None
@@ -2016,6 +2807,9 @@ def main(argv=None) -> int:
             "; folder inside a larger repository, history limited to this folder" if state["subtree"] else "")
         if gitres.get("history_shallow"):
             reasons.append("shallow_clone")
+        else:
+            ppl = st.run(f"people-{a.cutoff}-{a.cutoff_early}-{h(a.link_salt, 8)}",
+                         lambda: stage_people(repo, ref["_rev"], pathspec, a.cutoff, a.cutoff_early, a.link_salt))
         try:
             head_fp = h("head:" + git(repo, "rev-parse", "HEAD").strip(), 32)
             measured_fp = h("head:" + git(repo, "rev-parse", ref["_rev"][0]).strip(), 32) if ref["_rev"][0] != "--all" else None
@@ -2108,6 +2902,74 @@ def main(argv=None) -> int:
                             "not run: history is truncated or missing" if not state["has_commits"] or gitres.get("history_shallow") else ""),
         "task_mining": task_mining,
     }
+    n_commits = gitres.get("commits")
+    single = gitres.get("history_single_commit")
+    if ppl:
+        doc["git"]["pre_chatgpt_commits"] = ppl["pre_chatgpt"]
+        doc["git"]["pre_chatgpt_share"] = round(ppl["pre_chatgpt"] / n_commits, 3) if n_commits and not single else None
+    else:
+        doc["git"]["pre_chatgpt_commits"] = 0 if n_commits == 0 else None
+        doc["git"]["pre_chatgpt_share"] = None
+    doc["cutoff_early"] = a.cutoff_early
+    lab = "verified" if ppl else "unknown"
+    doc["cutoffs"] = {
+        "pre_2025": {"date": a.cutoff, "count": gitres.get("pre_cutoff_commits"), "share": gitres.get("pre_cutoff_share"),
+                     "label": lab, "unit": "commits"},
+        "pre_chatgpt": {"date": a.cutoff_early, "count": doc["git"]["pre_chatgpt_commits"],
+                        "share": doc["git"]["pre_chatgpt_share"], "label": lab, "unit": "commits"},
+    }
+    names_all = [p_ for p_, _ in list_files(repo)]
+    if ppl:
+        doc["people"] = dict(ppl["people"], label="estimated", link_salt_used=bool(a.link_salt),
+                             method="commit authors without bots or agents, merged on email, GitHub noreply login and "
+                                    "normalised name; active person-months are months with at least one commit")
+        tk_ = dict(ppl["tickets"], label="verified", link_salt_used=bool(a.link_salt),
+                   method="non-merge commit messages naming a project key (ABC-123) or #123; keys are hashed")
+        doc["ticket_refs"] = tk_
+    else:
+        why = "no history (folder without git, empty or shallow clone)"
+        doc["people"] = {"merged_people": 0 if n_commits == 0 else None, "identities": None, "by_year": {}, "persons": [],
+                         "label": "verified" if n_commits == 0 else "unknown", "method": why, "link_salt_used": bool(a.link_salt)}
+        doc["ticket_refs"] = {"commits_with_ref": 0 if n_commits == 0 else None, "share": None, "fix_commits_with_ref": None,
+                              "by_pattern": {}, "key_hashes": [], "key_hashes_capped": False,
+                              "label": "verified" if n_commits == 0 else "unknown", "method": why, "link_salt_used": bool(a.link_salt)}
+    settle = json.loads(a.settle.read_text("utf-8")) if a.settle else {}
+    if simple:
+        roots_ = unreal_roots(names_all)
+        own = {"own_loc": None, "own_files": None, "by_language": {}, "excluded": {}, "excluded_loc": None,
+               "unreal_projects": len(roots_), "engine_fork": None, "studio_names_given": bool(a.studio_name),
+               "content_folders": {}, "assets_own": None, "assets_excluded": None, "lfs_pointer_assets": None, "unsettled": {},
+               "_bp": {"status": "not_run" if roots_ else "not_unreal", "total": {}, "own": {}, "excluded": {}}}
+        lanes["own_code"] = "not run (simple mode)"
+    else:
+        own = st.run(f"own-{h(json.dumps([a.studio_name, settle], sort_keys=True), 8)}",
+                     lambda: stage_own_code(repo, a.studio_name, settle))
+        lanes["own_code"] = "every code file read under the own-code rules" + (
+            f"; Blueprint counter {own['_bp']['status'].replace('_', ' ')}" if own["unreal_projects"] else "")
+    un = own.get("unsettled") or {}
+    phr = {"content_folders": "top-level Content folders to mark own, template or bought",
+           "plugins": "plugins whose CreatedBy is not settled", "foreign_copyright_files": "files with another copyright holder to confirm",
+           "non_cpp_code_in_unreal_loc": "lines of non-C++ code inside Unreal projects to confirm"}
+    open_items = [f"{v:,} {phr.get(k, k.replace('_', ' '))}" for k, v in un.items() if v and not isinstance(v, bool)]
+    if un.get("copyright_holders_presumed"):
+        open_items.append("the studio's copyright holder presumed (pass --studio-name)")
+    doc["own_code"] = {k: v for k, v in own.items() if not k.startswith("_")}
+    doc["own_code"].update(
+        label="unknown" if own["own_loc"] is None else ("estimated" if open_items else "verified"),
+        method=("not run in simple mode" if own["own_loc"] is None else
+                "non-blank lines including comments in code files, each distinct file content once, after excluding engine "
+                "source, third-party and unsettled plugins, Asset Store packages, template and bought content, build rules, "
+                "vendored and generated code and files whose copyright header names another holder"
+                + ("; to settle: " + "; ".join(open_items) if open_items else "")))
+    doc["engine_content"] = blueprint_block(own, names_all)
+    doc["perforce"] = stage_p4(a.p4_path)
+    if doc["perforce"]["status"] != "not_requested":
+        lanes["perforce"] = doc["perforce"]["status"].replace("_", " ")
+    fresh = bool(n_commits and n_commits <= 20 and (gitres.get("span_days") or 0) <= 14)
+    doc["git"]["fresh_upload"] = fresh if n_commits else None
+    if fresh:
+        info["history"] = "fresh_upload"
+    doc["restrictions"] = code_restrictions(names_all, tree.get("_sourcing"), self_flags, a.ownership)
     if not simple:
         sig = {k: v for k, v in signals.items() if not k.startswith("_")}
         sig.update(tree["_observability"] and {"health_endpoint": tree["_observability"]["health_endpoint"],
@@ -2125,6 +2987,8 @@ def main(argv=None) -> int:
         tests.pop("mock_calls", None)
         tests.pop("assertions", None)
     doc["recommendation"] = recommend(doc)
+    doc["code_table"] = code_table(doc, own, a.project_type)
+    doc["labels"] = labels_for(doc, simple)
     doc["privacy"] = {"authors": "counted, never named", "paths": "not emitted", "messages": "not emitted",
                       "review_lane": "the reviewer census is written by the AI model of the session running the skill, "
                                      "which reads the source under the user's own account; the script itself makes no network calls"}
@@ -2153,6 +3017,9 @@ def main(argv=None) -> int:
         w.writeheader()
         w.writerow(row)
     atomic_write(out / "report.md", render_report(doc))
+    if own.get("_private"):
+        write_private(out, own, doc["label"])
+        log(f"settling list (names, PRIVATE, stays on this machine): {out / '.private' / 'settling.md'}")
     log(f"wrote measure.json, summary_row.json/.csv and report.md to {out}")
     log(f"status: {status}" + (f" ({', '.join(reasons)})" if reasons else ""))
     log(f"full run: {doc['recommendation']['full_run']}")
