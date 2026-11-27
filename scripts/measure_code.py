@@ -1509,9 +1509,9 @@ def task_block(sig: dict | None, reason: str = "not run in simple mode") -> dict
 # Reasons a full run is `partial`: something failed, timed out or was skipped. A build the user did not ask for
 # (the default --build detect) is not one of them; it is recorded as status_info.build = "not_requested".
 STATUS_REASONS = ("simple_mode", "not_a_git_repository", "no_commits", "shallow_clone", "census_not_run",
-                  "task_mining_skipped", "build_failed", "tests_failed", "build_environment_missing", "build_timed_out",
+                  "task_mining_skipped", "build_failed", "build_environment_missing", "build_timed_out",
                   "build_unsupported", "code_age_partial", "code_age_not_run")
-BUILD_REASON = {"build_failed": "build_failed", "tests_failed": "tests_failed", "environment_missing": "build_environment_missing",
+BUILD_REASON = {"build_failed": "build_failed", "environment_missing": "build_environment_missing",
                 "timed_out": "build_timed_out", "unsupported": "build_unsupported"}
 
 
@@ -2043,6 +2043,8 @@ def main(argv=None) -> int:
             info["build"] = "not_requested"
         elif build["status"] in BUILD_REASON:
             reasons.append(BUILD_REASON[build["status"]])
+        elif build["status"] == "tests_failed":
+            info["tests"] = "some_failed"  # a pass rate is a measurement, not a failure of the run
         if a.blame_seconds > 0 and state["has_commits"] and not gitres.get("history_shallow"):
             code_age = st.run("blame", lambda: stage_blame(repo, a.cutoff, a.blame_seconds))
             lanes["code_age"] = "complete" if code_age["complete"] else \

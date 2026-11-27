@@ -46,7 +46,7 @@ python3 $SKILL/scripts/measure_code.py ~/code/my-game \
     --out ./measure-out/game-client --label game-client --tag project:my-game
 ```
 
-Reasons: `simple_mode`, `not_a_git_repository`, `no_commits`, `shallow_clone`, `census_not_run`, `task_mining_skipped`, `build_failed`, `tests_failed`, `build_environment_missing`, `build_timed_out`, `build_unsupported`, `code_age_partial`, `code_age_not_run`.
+Reasons: `simple_mode`, `not_a_git_repository`, `no_commits`, `shallow_clone`, `census_not_run`, `task_mining_skipped`, `build_failed`, `build_environment_missing`, `build_timed_out`, `build_unsupported`, `code_age_partial`, `code_age_not_run`. Failing tests are not a reason: the pass rate is reported, and `tests: some_failed` is recorded as info.
 
 The build reasons apply only to a build you asked for (`--build discover` or `full`). With the default `--build detect` no build is executed, and that is recorded as info (`status_info: {"build": "not_requested"}`), not as a reason for `partial`. Simple mode is always `estimate`.
 
