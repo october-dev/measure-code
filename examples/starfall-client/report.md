@@ -164,7 +164,7 @@ People (merged identities, label estimated): 14 from 17 author identities. Only 
 | 2023 | 10 | 77 |
 | 2024 | 5 | 35 |
 
-Commits naming a ticket (label verified): 3,572 (38.0%); of them fixes 1,464. Project keys (ABC-123): 3,384 commits, 1,400 keys; #123 references: 188 commits, 117 keys. Hashed keys let master-valuate link resolved bugs to fixes.
+Commits naming a ticket (label verified): 3,572 (38.0%); of them fixes 1,464. Project keys (ABC-123): 3,384 commits, 1,400 keys; #123 references: 188 commits, 117 keys. Hashed keys let resolved bugs be linked to fixes.
 
 Engine content tracked: uasset 0, umap 0, unity 62, prefab 932, tscn 0.
 
@@ -209,7 +209,7 @@ Code table (block E):
 
 ## Provenance
 
-- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `97326fa9dc5f3bd4e1dd7b3957e0f0da`; payload digest `997977444dbd2992dd6576fcc459c23f`
+- head commit fingerprint `87f4aae41790b7d5fdde6e029649aa7f`; scripts digest `157b24cf43439268e08b564e0412ec80`; payload digest `f6bf247330f59697db11ea0c2d8238a3`
 - A buyer can check these numbers on their own copy: `measure_code.py <repo> --verify measure.json`.
 
 ## Caveats

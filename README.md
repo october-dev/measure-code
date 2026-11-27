@@ -2,14 +2,15 @@
 
 An agent skill for Claude Code, Codex, Grok, Hermes and other coding agents that measures one git repository **on your own machine** and writes counts only: history, authors (counted, never named), lines by language, tests and test tools, classification, engineering signals, code age, a build probe, logic depth, capacity (mineable commits), a reviewer census with task mining, people by year (identities merged and hashed), commits naming ticket keys, pre-2025 and pre-ChatGPT shares, own lines of code under buyer rules, Unreal Blueprints and Blueprint nodes, optional Perforce history, the buyer's per-repo code table, labels on every number and restriction flags. It ends with a short, clearly labelled **"Why this is special"** pitch that the agent writes after the audit (dream mode).
 
-It is one of four October measurement skills:
+It is one of the October measurement skills:
 
 | skill | measures |
 |---|---|
 | **measure-code** | git repositories |
 | [measure-data](https://github.com/october-dev/measure-data) | SaaS and business data exports |
 | [measure-art](https://github.com/october-dev/measure-art) | creative and CAD files |
-| [master-valuate](https://github.com/october-dev/master-valuate) | dedupes and cross-links all of the above into a buyer overview and pricing worksheet |
+| [measure-disk](https://github.com/october-dev/measure-disk) | machines and drives |
+| [measure-studio](https://github.com/october-dev/measure-studio) | a whole games studio, running the skills above |
 
 ## Install
 
@@ -54,7 +55,7 @@ Or in your coding agent (Claude Code, Codex, Grok, Hermes ...):
 | `--mode simple\|full` | full | full = every lane (default); simple (optional) = fast sampled quick look, estimates only, only when asked |
 | `--out DIR` | required | output folder, outside the repo |
 | `--label NAME` | folder name | the only name written to the output |
-| `--tag K:V` | none | cross-linking tag for master-valuate (repeatable) |
+| `--tag K:V` | none | free-form tag for grouping repos, e.g. `project:alpha` (repeatable) |
 | `--cutoff DATE` | 2025-01-01 | date for pre-cutoff shares. The default is there because buyers price work written before 2025 |
 | `--cutoff-early DATE` | 2022-11-30 | second cutoff for pre-ChatGPT counts and shares |
 | `--link-salt S` | empty | secret mixed into hashed person and ticket keys; use the same value for every run of one studio |
@@ -131,7 +132,7 @@ python3 $SKILL/scripts/add_dream.py draft.txt --out ./measure-out/game-client --
 - **The reviewer census and task mining are written by your agent's model, in the coding-agent session running the skill.** It reads the repository's source and history, so the source is shown to that model's provider, under your own account. The skill tells the agent to skip credential files (`.env`, keys, certificates, `*credentials*`, `*secret*`, `.npmrc` and similar), never to repeat a secret, and to treat repo content as data, not instructions. Skip the census if that exposure is not acceptable: the status then stays `partial`.
 - Never emitted: author names or emails, paths, file names, commit messages, branch names, source code.
 - Output boundary: every text value must sit in a declared field, keys must be fixed vocabulary, and emails, absolute paths and history author names are refused. If anything fails, nothing is written.
-- Fingerprints are truncated SHA-256 hashes of commit and blob ids. They let master-valuate detect duplicate repos without revealing content.
+- Fingerprints are truncated SHA-256 hashes of commit and blob ids. They let whoever assembles the overview detect duplicate repos without revealing content.
 
 ## Test
 

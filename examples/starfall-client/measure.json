@@ -1015,8 +1015,8 @@
   "provenance": {
     "head_commit_fingerprint": "87f4aae41790b7d5fdde6e029649aa7f",
     "measured_commit_fingerprint": "87f4aae41790b7d5fdde6e029649aa7f",
-    "scripts_digest": "97326fa9dc5f3bd4e1dd7b3957e0f0da",
-    "payload_digest": "997977444dbd2992dd6576fcc459c23f"
+    "scripts_digest": "157b24cf43439268e08b564e0412ec80",
+    "payload_digest": "f6bf247330f59697db11ea0c2d8238a3"
   },
   "cutoff_early": "2022-11-30",
   "cutoffs": {

@@ -1412,7 +1412,7 @@ KEY_HASH_CAP = 50_000
 
 
 def link_hash(kind: str, value: str, salt: str = "") -> str:
-    """One-way key shared with measure-data and master-valuate, so the same email, login, name or ticket key
+    """One-way key shared with measure-data and the overview, so the same email, login, name or ticket key
     links across repositories and runs without being written down. A studio can pass --link-salt to every run."""
     return hashlib.sha256(f"{salt}|{kind}|{value}".encode("utf-8", "replace")).hexdigest()[:16]
 
@@ -2428,7 +2428,7 @@ def people_section(doc: dict) -> list:
               f"({fmt(tr.get('share'))}); of them fixes {fmt(tr.get('fix_commits_with_ref'))}. Project keys (ABC-123): "
               f"{fmt((bp.get('project_key') or {}).get('commits'))} commits, {fmt((bp.get('project_key') or {}).get('distinct_keys'))} keys; "
               f"#123 references: {fmt((bp.get('hash_number') or {}).get('commits'))} commits, "
-              f"{fmt((bp.get('hash_number') or {}).get('distinct_keys'))} keys. Hashed keys let master-valuate link resolved bugs to fixes."]
+              f"{fmt((bp.get('hash_number') or {}).get('distinct_keys'))} keys. Hashed keys let resolved bugs be linked to fixes."]
     fb = ec.get("files_by_type") or {}
     L += ["", "Engine content tracked: " + ", ".join(f"{k} {fmt(v)}" for k, v in fb.items()) + "."]
     if rs:
